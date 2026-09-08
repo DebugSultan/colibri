@@ -49,7 +49,7 @@ Fase 2 non è «scrivere kernel», è «collegare qwen38 al backend che c'è».
 | voce | valore | come lo so |
 |---|---|---|
 | percorso | `~/models/Qwen3.8-Flash-Next-FP8` | in locale |
-| dimensione | **185.563.800.832 B** = 185,50 GB dec = **172,76 GiB** | `du` + somma degli header |
+| dimensione | **185.563.800.832 B** = 185,56 GB dec = **172,82 GiB** (i soli dati tensori: 185,50 GB / 172,76 GiB; la differenza è header + file non-shard) | `du` + somma degli header |
 | file | 144 (di cui **131 shard** safetensors) | conteggio |
 | tensori | **152.089** | parsing degli header |
 | formato pesi | **FP8 E4M3 nativo** + scale, misto BF16 sui moduli densi | `config.json` + dtype degli header |
@@ -87,7 +87,7 @@ ricavati contando:
 down 1.638.400, in FP8).
 
 > ⚠️ **Discrepanza da segnalare.** Un commento nel sorgente
-> (`qwen38_core.h:1097`) parla di «14 MB per miss». Gli header dicono
+> (`qwen38_core.h:1098`) parla di «14 MB per miss». Gli header dicono
 > 4,69 MiB per esperto. I 14 MB corrispondono a 3× quel valore, o a
 > un'espansione che nel percorso `Q38_NATIVE_FP8=1` non avviene.
 > **La fonte autorevole sono gli header, non il commento**: il numero
@@ -168,7 +168,7 @@ esattamente le tre che servono a giudicare se il prefetch paga.
 
 ### 2.3 Il guardiano della RAM
 
-`colibri.c:810-835` documenta una trappola già disinnescata a monte
+`colibri.c:817-839` documenta una trappola già disinnescata a monte
 (issue #1325) e che vale la pena conoscere prima di accendere la mappatura:
 
 > `rss_guard` **sfratta esperti** quando la misura supera il budget. Con la
@@ -267,15 +267,20 @@ Ogni modifica al loader o al formato dei pesi va provata prima qui.
 |---|---|
 | CPU | Ryzen 9 3900X (12c/24t) |
 | RAM | 64 GB (≈45 GiB utilizzabili col K12 in produzione) |
-| GPU | 2× GTX 1070, 8 GB ciascuna, **sm_61 (Pascal)** |
-| disco | NVMe, 312 GB liberi |
+| GPU | RTX 5060 Ti 16 GB + RTX 5070 Ti 16 GB, **Blackwell sm_120**, 32 GiB totali |
+| disco | NVMe Samsung 990 PRO 1 TB, 312 GB liberi |
 
 Vincoli hardware che non si negoziano:
 
-- **Pascal non ha FlashAttention** (constatato dal titolare);
-- **Pascal non ha tensor core FP8**: qualunque FP8 sulle 1070 è *storage*,
-  decompresso in registro, non aritmetica nativa;
-- le due 1070 non hanno NVLink e stanno su PCIe stretto.
+- le due schede **non hanno NVLink** e stanno su PCIe stretto: la
+  collocazione degli esperti tra le due VRAM è una decisione di progetto;
+- sm_120 richiede **CUDA ≥ 12.8** (in casa è pinnata la 13.0);
+- l'FP8 su sm_120 è **aritmetica nativa** (tensor core), non storage:
+  il guadagno del tier VRAM è di banda, residenza *e* FLOPS.
+
+Le 2× GTX 1070 (8 GB, Pascal sm_61) sono su **node-02** e non sono nel
+percorso di questa campagna: la prima stesura di questa sezione le
+attribuiva a node-01 ed era errata (corretto il 08/09).
 
 **Vincolo operativo assoluto: il cervello di produzione K12 (27B) sul
 node-01 non si ferma senza un via esplicito del titolare.** Ogni misura di
@@ -345,11 +350,13 @@ più le varianti pesate `grouped_hidden_f8w_dual` (`:933`) e
 `grouped_down_f8w` (`:968`), selezionate a `:1918` e `:2113` sui rami
 `all_f8`. Gruppi misti E8/FP8 ricadono sul percorso per-esperto.
 
-**Conseguenza sul piano: la Fase 2 non è «scrivere kernel FP8 per Pascal».
+**Conseguenza sul piano: la Fase 2 non è «scrivere kernel FP8».
 È collegare il percorso qwen38 — oggi NOCUDA per costruzione — al backend
 CUDA che esiste già.** È un lavoro di plumbing e di gestione della memoria,
-non di aritmetica. Resta vero che su Pascal l'FP8 sarà storage e non
-aritmetica: il guadagno atteso è di **banda e di residenza**, non di FLOPS.
+non di aritmetica. Su sm_120 l'FP8 è aritmetica nativa: il guadagno atteso
+è di **banda, residenza e FLOPS**. La recon documenta in albero anche il
+percorso DeepGEMM `sm_120a` (opt-in `DEEPGEMM=1`, blocchi FP8) da valutare
+per i GEMM degli esperti.
 
 ### 5.3 Il vincolo del tier che va invertito
 
@@ -435,9 +442,10 @@ condivise con la produzione.
    uno slot sfrattabile;
 2. collegare il percorso qwen38 ai kernel raggruppati esistenti — `fmt=8`
    subito, `fmt=4` se la Fase 1 è passata;
-3. 16 GB di VRAM totali su due schede senza NVLink: la politica di
-   collocazione degli esperti fra le due schede è essa stessa una decisione
-   di progetto, non un dettaglio.
+3. 32 GiB di VRAM su due schede senza NVLink, **condivisa col K12 di
+   produzione** (picco misurato 30.962 MiB): la politica di collocazione
+   degli esperti fra le due schede è essa stessa una decisione di progetto,
+   non un dettaglio.
 
 ### Fase 3 — non pianificata
 

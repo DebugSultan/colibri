@@ -149,9 +149,11 @@ I 28 MiB della ricognizione erano calcolati su scale **F32**: 24.576 × 300 × 4
 **La RAM qui è una manopola, non un soffitto.** È il punto che ribalta tutto
 rispetto alla linea llama.cpp: lì i 99 GB di RAM+VRAM erano un tetto e la
 quantizzazione era l'unica leva; qui `cap` decide solo *quanto* cache si
-compra. Con 64 GB e ~45 GiB utili dopo denso, workspace e sistema, si arriva a
-**cap ≈ 192** — cioè il **39 % di residenza** (9.829 esperti su 25.088), contro
-il 6 % (cap 32) su cui upstream misura già **53,8 % di hit**.
+compra. Con 64 GB e ~45 GiB utili dopo denso, workspace e sistema, il budget
+regge **cap ≈ 205** — il **39 % di residenza** (9.829 esperti su 25.088);
+la curva 0.3 si ferma a 192 (≈42 GiB, 9.216 esperti, 36,7 %) per non
+saturarlo. Punto di riferimento: al 6 % (cap 32) upstream misura già
+**53,8 % di hit**.
 
 ---
 
@@ -279,18 +281,27 @@ Nessun rischio per il K12: `COLI_CUDA` resta a 0, non si tocca la VRAM.
 - **0.2** baseline con `COLI_TIMERS=1`: confermare (o smentire) la
   scomposizione 96/17/14/2,6 su *questa* macchina, non su quella della
   ricognizione.
+- **0.2b** **`COLI_MAP_EXPERTS=1` contro il percorso a copia**: stessa
+  scomposizione, due configurazioni, stesso prompt. ⚠️ Leggere `RssAnon`,
+  non `VmRSS` (`colibri.c:817-839`): con la mappatura accesa chi guarda
+  `VmRSS` — script e `htop` — legge un numero che mente.
 - **0.3** **curva hit-rate contro `cap`**: 16 · 32 · 64 · 96 · 128 · **192**.
-  Spinta fino a ~42 GiB, non fermata a 96 — la nostra RAM regge il 40 % di
-  residenza contro il 6 % su cui upstream ha misurato. Da
-  `ColiExpertStoreStats` (`requests`, `hits`, `misses`, `bytes_read`,
-  `resident_bytes`) — la struttura c'è già, non va scritta.
+  Spinta fino a ~42 GiB, non fermata a 96 — la nostra RAM regge ~il 39 % di
+  residenza (cap 205) contro il 6 % su cui upstream ha misurato. Da
+  `ColiExpertStoreStats` — **otto** statistiche, non cinque
+  (`requests`, `hits`, `misses`, `prefetched`, `prefetch_hits`,
+  `bytes_read`, `resident_bytes`, `capacity_bytes`) — la struttura c'è già,
+  non va scritta.
 - **0.4** ~~chiudere il «14 MB per miss»~~ **CHIUSO senza banco**: l'header dice
   4.915.800 B per esperto (§1.2). I 14 MB della ricognizione sono
   **~3 esperti**, non uno: o un miss contava l'intero gruppo top-k parziale, o
   la cifra era per-layer e non per-esperto. Il numero da usare è **4,6881 MiB**.
-- **0.5** verificare come colibri gestisce la **tabella N-gram da 51,3 GB**
-  (§1.3): mmap, streaming o caricamento? È un quarto del checkpoint e nessuno
-  dei due documenti la contava. Se pretende residenza, il piano cambia.
+- **0.5** ~~verificare come colibri gestisce la tabella N-gram da 51,3 GB~~
+  **CHIUSO dal sorgente, non a banco** (SPEC §2.4): `q38_ple_row`
+  (`qwen38_core.h:1344`) legge **una riga per volta dallo shard** — 16 teste
+  × 160 B = 2.560 B per token — niente residenza, una sola scala BF16
+  globale, e prefetch `Q38_PLE_PREFETCH` (default 1) perché gli indici di
+  riga sono noti prima di ogni calcolo.
 
 **La curva 0.3 è il giudice.** Dice quanto vale un GiB liberato — cioè quanto
 vale l'int4 — e quanto vale un GiB di VRAM. Prima della curva, ogni scelta
@@ -333,6 +344,8 @@ restano su CPU.
 
 | | |
 |---|---|
+| 08/09 | **verifica referenze**: censimento e `config.json` ripresi dai 131 header a terra — tutto confermato (152.089 tensori, 25.088 esperti, zero F32, 943 voci non convertite, top-k 10, PLE al layer 2); tutte le citazioni di sorgente reggono sulla working tree (branch `qwen38cuda` = `fd93c41` + solo doc, nessun sorgente toccato) |
+| 08/09 | **correzioni**: GPU di node-01 = 5060 Ti + 5070 Ti (sm_120, 32 GiB) — la SPEC aveva per errore le 2×1070 di node-02, cascata §3/§5.2/§6 corretta; §3 riordinato (cap 192 = 36,7 % ≈42 GiB, cap 205 = 39 % ≈45 GiB); 0.5 chiuso dal sorgente, aggiunto 0.2b, statistiche = 8; totale checkpoint precisato (185,56 GB / 172,82 GiB) |
 | 07/09 23:11 | **download COMPLETO e verificato per montaggio** — 185.563.800.832 B, 144 file, 131 shard, 0 residui `.incomplete`; tutti i 131 header safetensors si aprono, tutti i **152.089** offset cadono dentro i file |
 | 07/09 23:2x | **censimento dei byte per famiglia** (§1.2, §1.3): esperti **25.088 non 24.576** (c'è il layer MTP), scale FP8 **BF16 non F32**, e una **tabella N-gram da 51,27 GB = 27,6 %** che nessuno aveva contato. Punto 0.4 chiuso, nuovo punto 0.5 |
 | 07/09 22:4x | download avviato — 185,6 GB, revisione pinnata, riavviabile, `~/models/Qwen3.8-Flash-Next-FP8`, log in `~/models/.dl-qwen38next.log` |
