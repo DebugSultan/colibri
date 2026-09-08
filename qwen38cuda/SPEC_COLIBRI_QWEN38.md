@@ -392,7 +392,7 @@ richiede di fermare il K12.
 | 0.1 | build del target CPU `qwen38` | il binario esiste e `qwen38-tiny-check` passa su tutta la matrice | ✅ chiuso 08/09: 8/8 configurazioni, token 8/8 + oracolo numerico, prefetch 16/16 |
 | 0.2 | baseline con `COLI_TIMERS=1` sul 3900X vero | scomposizione del tempo per token misurata **da noi**, confrontata col §4 | ✅ chiuso 08/09: disco 36 % / expert 33 % / attn 28 % / lm-head 3 %, 1,64 s/token (copia) |
 | **0.2b** | **`COLI_MAP_EXPERTS=1` contro il percorso a copia** | **stessa scomposizione, due configurazioni, stesso prompt; ⚠️ leggere `RssAnon`, non `VmRSS` (§2.3)** | ✅ chiuso 08/09: 1,18 s/token, `RssAnon` 11,2 vs 18,1 GiB, +25,9 GiB file-backed |
-| 0.3 | **curva hit-rate vs `cap`** a 16·32·64·96·128·192 | curva completa con le statistiche della cache qwen38 (⚠️ *non* `ColiExpertStoreStats`: è dello store deepseek_v4, il percorso qwen38 ha contatori propri — v. PIANO 08/09) | in corso: 16→22,4 %, 32→32,5 %, 64→41,3 %; 96/128/192 in attesa di finestra K12 |
+| 0.3 | **curva hit-rate vs `cap`** a 16·32·64·96·128·192 | curva completa con le statistiche della cache qwen38 (⚠️ *non* `ColiExpertStoreStats`: è dello store deepseek_v4, il percorso qwen38 ha contatori propri — v. PIANO 08/09) | in corso: prompt corto 16→22,4 %, 32→32,5 %, 64→41,3 % (decode fermo); prompt lungo (274 t.) 16→7,5 %, 32→10,2 %, 64→26,8 % con decode 10,0/9,6/9,2 s/tok; 96/128/192 in attesa di finestra K12 |
 | 0.4 | censimento byte e offset | ✅ chiuso (§1.2) | fatto |
 | 0.5 | residenza della tabella N-gram | ✅ **chiuso dal sorgente** (§2.4): streaming per riga, mai residente | fatto |
 
