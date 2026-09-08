@@ -277,7 +277,15 @@ VRAM, da solo, tocca solo i 33,6 s di calcolo. E i due si sommano.
 
 Nessun rischio per il K12: `COLI_CUDA` resta a 0, non si tocca la VRAM.
 
-- **0.1** build CPU del target `qwen38` sul 3900X reale.
+- **0.1** ~~build CPU del target `qwen38`~~ **CHIUSO**: build pulita
+  (gcc 15.2, `-O3 -march=native -fopenmp`, zero warning), `qwen38-tiny-check`
+  verde su tutta la matrice — 8/8 (batch 0/1 × BF16 0/1 × cap 1/4), token
+  8/8 e oracolo numerico PASS (cosine 0,99999, max_abs 8,4e-4 < 1e-2) — e
+  `qwen38-ple-prefetch-check` verde (16 configurazioni, token identici
+  prefetch on/off). Il generatore del banco richiede `torch` +
+  `transformers==5.16.1`: venv dedicato in
+  `/opt/zyonix/backend/qwen38-tiny-venv`, invocato con
+  `make PYTHON=/opt/zyonix/backend/qwen38-tiny-venv/bin/python`.
 - **0.2** baseline con `COLI_TIMERS=1`: confermare (o smentire) la
   scomposizione 96/17/14/2,6 su *questa* macchina, non su quella della
   ricognizione.
@@ -344,6 +352,7 @@ restano su CPU.
 
 | | |
 |---|---|
+| 08/09 | **0.1 chiuso**: build CPU pulita sul 3900X reale, `qwen38-tiny-check` 8/8 verde (token 8/8 + oracolo numerico) e prefetch-check 16/16 verde; venv torch+transformers 5.16.1 in `/opt/zyonix/backend/qwen38-tiny-venv` |
 | 08/09 | **verifica referenze**: censimento e `config.json` ripresi dai 131 header a terra — tutto confermato (152.089 tensori, 25.088 esperti, zero F32, 943 voci non convertite, top-k 10, PLE al layer 2); tutte le citazioni di sorgente reggono sulla working tree (branch `qwen38cuda` = `fd93c41` + solo doc, nessun sorgente toccato) |
 | 08/09 | **correzioni**: GPU di node-01 = 5060 Ti + 5070 Ti (sm_120, 32 GiB) — la SPEC aveva per errore le 2×1070 di node-02, cascata §3/§5.2/§6 corretta; §3 riordinato (cap 192 = 36,7 % ≈42 GiB, cap 205 = 39 % ≈45 GiB); 0.5 chiuso dal sorgente, aggiunto 0.2b, statistiche = 8; totale checkpoint precisato (185,56 GB / 172,82 GiB) |
 | 07/09 23:11 | **download COMPLETO e verificato per montaggio** — 185.563.800.832 B, 144 file, 131 shard, 0 residui `.incomplete`; tutti i 131 header safetensors si aprono, tutti i **152.089** offset cadono dentro i file |
