@@ -286,13 +286,13 @@ Nessun rischio per il K12: `COLI_CUDA` resta a 0, non si tocca la VRAM.
   `transformers==5.16.1`: venv dedicato in
   `/opt/zyonix/backend/qwen38-tiny-venv`, invocato con
   `make PYTHON=/opt/zyonix/backend/qwen38-tiny-venv/bin/python`.
-- **0.2** baseline con `COLI_TIMERS=1`: confermare (o smentire) la
-  scomposizione 96/17/14/2,6 su *questa* macchina, non su quella della
-  ricognizione.
-- **0.2b** **`COLI_MAP_EXPERTS=1` contro il percorso a copia**: stessa
-  scomposizione, due configurazioni, stesso prompt. ⚠️ Leggere `RssAnon`,
-  non `VmRSS` (`colibri.c:817-839`): con la mappatura accesa chi guarda
-  `VmRSS` — script e `htop` — legge un numero che mente.
+- **0.2** ~~baseline con `COLI_TIMERS=1`~~ **CHIUSO** (vedi §9, 08/09): la
+  scomposizione 96/17/14/2,6 si conferma nelle fasi ma **non nelle quote** —
+  su questa macchina il disco pesa 36 %, non il 69 % del box di riferimento.
+- **0.2b** ~~`COLI_MAP_EXPERTS=1` contro il percorso a copia~~ **CHIUSO**
+  (vedi §9, 08/09): pattern identico bit per bit, 1,38× più veloce in steady
+  state, −6,9 GiB di anonimo, +25,9 GiB di page cache ancorata; `RssAnon`
+  misurato come da avvertenza (non `VmRSS`).
 - **0.3** **curva hit-rate contro `cap`**: 16 · 32 · 64 · 96 · 128 · **192**.
   Spinta fino a ~42 GiB, non fermata a 96 — la nostra RAM regge ~il 39 % di
   residenza (cap 205) contro il 6 % su cui upstream ha misurato. Da
@@ -352,6 +352,8 @@ restano su CPU.
 
 | | |
 |---|---|
+| 08/09 | **0.2 chiuso — scomposizione per token di decode** (cap 32, 12 thread, prompt 28 + 16 nuovi, 16 forwards; stessa riga I/O in tutti i run: weight-ranges 16116, coalesced-gate-up 8058, prefetched 16116 = 100 %, parallel-batches 828, resident-scales 28,12 MiB; hit rate 32,5 % = hit 3871 / miss 8058, 5687 esperti distinti di 25088). Copia, steady state: expert-read **498 ms**, routed-expert 408, shared 40, resident-mm 561 (sovrapposto), deltanet 378, qsa 0,3+4,7, ple 6,2, lm-head 38,2 ms/fwd → **1,64 s/token** (0,61 tok/s), TTFT 15,3 s (prefill 28), RssAnon picco **18,1 GiB** (RssFile ~0). Mappatura sui 4 termini del piano: disco ≈ 498 ms (36 %), expert-matmul ≈ 448 ms (33 %), attention ≈ 382 ms (28 %), lm-head ≈ 38 ms (3 %). **vs recon 96/17/14/2,6 s (disco 69 %)**: stessa fase n.1 a disco freddo, quote molto diverse — 990 PRO + prefetch al 100 % + gate-up coalesced = ~0,5 s/token di disco, ~30× meno del box di riferimento; le fasi CPU (matmul + deltanet + dense) diventano la quota visibile. Conseguenza: su questa macchina la Fase 2 deve attaccare il matmul CPU (routed+resident ≈ 1,38 s/fwd sovrapposto), non solo il disco; il disco resta il problema di TTFT/cold-start (11,5–15,4 s) |
+| 08/09 | **0.2b chiuso — copia vs mmap**: pattern di accesso identico bit per bit (riga I/O e hit rate uguali in tutti e 8 i run). Mmap steady state (dal 2° pass): expert-read **26 ms** vs 498 → **1,18 s/token** (0,85 tok/s, 1,38× più veloce), TTFT 11,5 s; primo pass dopo evizione paga re-fault + first-touch (routed-expert 947 ms). RAM: `RssAnon` picco **11,2 GiB vs 18,1** (lo slab mmap non esiste più, −6,9 GiB di anon) + **RssFile fino a 25,9 GiB** di page cache ancorata dai mapping (VmRSS 37,0 GB = somma; file pages recuperabili, ma in pratica sopravvivono alla pressione — a differenza della cache del percorso copia, che qui viene evictata: il run copia «warm» resta lento come il cold, 498 ms). La `PEAK RSS` del binario è `ru_maxrss` (VmRSS, include file pages) — per l'anonimo vero serve `RssAnon` da `/proc/<pid>/status` |
 | 08/09 | **0.1 chiuso**: build CPU pulita sul 3900X reale, `qwen38-tiny-check` 8/8 verde (token 8/8 + oracolo numerico) e prefetch-check 16/16 verde; venv torch+transformers 5.16.1 in `/opt/zyonix/backend/qwen38-tiny-venv` |
 | 08/09 | **verifica referenze**: censimento e `config.json` ripresi dai 131 header a terra — tutto confermato (152.089 tensori, 25.088 esperti, zero F32, 943 voci non convertite, top-k 10, PLE al layer 2); tutte le citazioni di sorgente reggono sulla working tree (branch `qwen38cuda` = `fd93c41` + solo doc, nessun sorgente toccato) |
 | 08/09 | **correzioni**: GPU di node-01 = 5060 Ti + 5070 Ti (sm_120, 32 GiB) — la SPEC aveva per errore le 2×1070 di node-02, cascata §3/§5.2/§6 corretta; §3 riordinato (cap 192 = 36,7 % ≈42 GiB, cap 205 = 39 % ≈45 GiB); 0.5 chiuso dal sorgente, aggiunto 0.2b, statistiche = 8; totale checkpoint precisato (185,56 GB / 172,82 GiB) |
