@@ -392,7 +392,7 @@ richiede di fermare il K12.
 | 0.1 | build del target CPU `qwen38` | il binario esiste e `qwen38-tiny-check` passa su tutta la matrice | ✅ chiuso 08/09: 8/8 configurazioni, token 8/8 + oracolo numerico, prefetch 16/16 |
 | 0.2 | baseline con `COLI_TIMERS=1` sul 3900X vero | scomposizione del tempo per token misurata **da noi**, confrontata col §4 | ✅ chiuso 08/09: disco 36 % / expert 33 % / attn 28 % / lm-head 3 %, 1,64 s/token (copia) |
 | **0.2b** | **`COLI_MAP_EXPERTS=1` contro il percorso a copia** | **stessa scomposizione, due configurazioni, stesso prompt; ⚠️ leggere `RssAnon`, non `VmRSS` (§2.3)** | ✅ chiuso 08/09: 1,18 s/token, `RssAnon` 11,2 vs 18,1 GiB, +25,9 GiB file-backed |
-| 0.3 | **curva hit-rate vs `cap`** a 16·32·64·96·128·192 | curva completa con le statistiche della cache qwen38 (⚠️ *non* `ColiExpertStoreStats`: è dello store deepseek_v4, il percorso qwen38 ha contatori propri — v. PIANO 08/09) | in corso: prompt corto 16→22,4 %, 32→32,5 %, 64→41,3 % (decode fermo); prompt lungo (274 t.) 16→7,5 %, 32→10,2 %, 64→26,8 % con decode 10,0/9,6/9,2 s/tok; 96/128/192 in attesa di finestra K12 |
+| 0.3 | **curva hit-rate vs `cap`** a 16·32·64·96·128·192 | curva completa con le statistiche della cache qwen38 (⚠️ *non* `ColiExpertStoreStats`: è dello store deepseek_v4, il percorso qwen38 ha contatori propri — v. PIANO 08/09) | ✅ **chiusa 08/09**: prompt lungo (274 t., copia) 16→7,5 %, 32→10,2 %, 64→26,8 %, 96→**49,0 %**, 128→**61,5 %**, 192→**71,4 %**; mmap agli stessi cap alti dà hit rate **identici** (path-independent). Minimo di tempo a **cap 128** (128,2 s per 16 token); i tempi di M192 sono invalidi per thrashing (swap 22,4 GiB), il tempo pulito a 192 lo dà N192 in mmap (137,4 s). **Verdetto: disco 13 %, denso 76 % (piatto) ⇒ Fase 2 prima di Fase 1** |
 | 0.4 | censimento byte e offset | ✅ chiuso (§1.2) | fatto |
 | 0.5 | residenza della tabella N-gram | ✅ **chiuso dal sorgente** (§2.4): streaming per riga, mai residente | fatto |
 
@@ -492,7 +492,8 @@ Regole vincolanti, ereditate da campagne che le hanno pagate care.
 
 ## 9. Stato
 
-- **Fase 0**: 0.1, 0.2, **0.2b**, 0.4 e 0.5 chiuse. 0.3 a un terzo (gradini 16/32/64 misurati; 96/128/192 in attesa di finestra col K12 a riposo).
+- **Fase 0**: **COMPLETA** (08/09) — 0.1, 0.2, 0.2b, **0.3**, 0.4 e 0.5 chiuse.
+- **Verdetto della curva**: a cap 128 il disco pesa il 13 % e il calcolo denso il 76 %, con `resident-mm`+`deltanet` piatti su tutta la curva ⇒ **Fase 2 (VRAM) prima di Fase 1 (int4)**, ordine invertito rispetto al piano originale. Nessuna delle due parte senza il via del titolare.
 - **Fase 1**: non iniziata, condizionata a 0.3.
 - **Fase 2**: non iniziata, richiede un via sul K12.
 - **Produzione**: intatta. Nulla di questo lavoro ha toccato il K12 né il 9B.

@@ -293,14 +293,23 @@ Nessun rischio per il K12: `COLI_CUDA` resta a 0, non si tocca la VRAM.
   (vedi §9, 08/09): pattern identico bit per bit, 1,38× più veloce in steady
   state, −6,9 GiB di anonimo, +25,9 GiB di page cache ancorata; `RssAnon`
   misurato come da avvertenza (non `VmRSS`).
-- **0.3** **curva hit-rate contro `cap`**: 16 · 32 · 64 · 96 · 128 · **192**.
-  Spinta fino a ~42 GiB, non fermata a 96 — la nostra RAM regge ~il 39 % di
-  residenza (cap 205) contro il 6 % su cui upstream ha misurato.
-  GRADINI 16/32/64 CHIUSI** (08/09, vedi §9) — misurati sia col prompt corto
-  (43 forwards: 22,4/32,5/41,3 %, decode fermo) sia col prompt lungo
-  (290 forwards: 7,5/10,2/26,8 %, decode 10,0/9,6/9,2 s/tok — il gradiente
-  vero); 96/128/192 in attesa di una finestra col K12 a riposo (cap 192 ≈
-  54 GiB di processo non stanno in 60 GB insieme al K12). ⚠️ **correzione**:
+- **0.3** ~~curva hit-rate contro `cap`: 16 · 32 · 64 · 96 · 128 · 192~~
+  **CHIUSA** (08/09, vedi §9). Percorso a copia col prompt lungo (290
+  forwards): **7,5 / 10,2 / 26,8 / 49,0 / 61,5 / 71,4 %**; percorso mmap
+  ai due gradini alti: **61,5 / 71,4 %** — identici. Il hit rate è
+  **indipendente dal percorso**: dipende solo dal numero di slot e dalla
+  politica di sfratto, non da come i byte arrivano in memoria.
+  ⚠️ i **tempi** di M192 sono invalidi (thrashing: swap di sistema a
+  22,4 GiB, `expert-read` che *sale* a 2192 ms mentre i miss si dimezzano) —
+  il tempo pulito a 192 lo dà N192, in mmap.
+  **Il verdetto — Fase 2 prima di Fase 1.** A cap 128 i 128,2 s si
+  scompongono in `resident-mm` 58,4 s + `deltanet` 39,1 s + `expert-read`
+  16,5 s: il **disco è sceso al 13 %**, il calcolo denso è al **76 %**, e
+  quel pavimento è **piatto** su tutta la curva (3657 → 3654 → 3652 ms/fwd
+  da cap 64 a 192). Azzerare del tutto il disco varrebbe ~13 %; oltre 128
+  un GiB liberato non vale nulla (N128 135,4 s contro N192 137,4 s, con
+  dieci punti di hit rate in più). Un GiB di **VRAM** vale invece l'intero
+  pavimento CPU. ⚠️ **correzione**:
   `ColiExpertStoreStats` è la
   struttura dello store **deepseek_v4** — il percorso qwen38 ha la propria
   cache (`q38_expert_get`, contatori `m.hits`/`m.miss` + riga I/O a 6
@@ -319,11 +328,16 @@ Nessun rischio per il K12: `COLI_CUDA` resta a 0, non si tocca la VRAM.
   globale, e prefetch `Q38_PLE_PREFETCH` (default 1) perché gli indici di
   riga sono noti prima di ogni calcolo.
 
-**La curva 0.3 è il giudice.** Dice quanto vale un GiB liberato — cioè quanto
-vale l'int4 — e quanto vale un GiB di VRAM. Prima della curva, ogni scelta
-d'ordine è un'opinione.
+**La curva 0.3 era il giudice, e ha sentenziato** (08/09, §9). Un GiB di RAM
+liberato — cioè l'int4 — compra hit rate, e il hit rate compra il **13 %** del
+tempo che è rimasto al disco; oltre cap 128 non compra nemmeno quello. Un GiB
+di **VRAM** attacca il **76 %** che sta nel calcolo denso, un pavimento che
+non si è mosso di 5 ms su tutta la curva. **L'ordine è quindi invertito:
+Fase 2 prima di Fase 1.** L'int4 resta valido come mezzo per far stare cap
+alti in meno RAM (o per liberare RAM al resto della macchina), non come leva
+di velocità.
 
-### Fase 1 — int4 (condizionata alla curva)
+### Fase 1 — int4 (declassata dalla curva: leva di RAM, non di velocità)
 
 1. Convertitore esperti FP8 128×128 → int4 `g4` gs=128. Solo i tensori
    routed: le 943 voci di `modules_to_not_convert` restano BF16, intatte.
@@ -333,7 +347,7 @@ d'ordine è un'opinione.
    su tre.
 4. Se la coda regge: ri-misura della curva 0.3 sul nuovo artefatto.
 
-### Fase 2 — tier VRAM (richiede una finestra sul K12)
+### Fase 2 — tier VRAM (**la leva vera**; richiede una finestra sul K12)
 
 `qwen38_tier.c/h` sul modello di `qwen36_tier`, con **il vincolo invertito**:
 `qwen36_tier.h:27-28` impone `cap_experts_per_layer == n_experts` perché il
@@ -360,6 +374,7 @@ restano su CPU.
 
 | | |
 |---|---|
+| 08/09 | **0.3 CHIUSA — gradini 96/128/192 su due percorsi, e il verdetto d'ordine** (stesso prompt lungo 274 t. + 16 nuovi = 290 forwards, 12 thread, stessa selezione in tutti i run: 138720 scelte su 12032 esperti distinti). **Copia**: cap 96 → **49,0 %** (22778/23754), expert-read **1329 ms/fwd**, TTFT 123,8 s, 133,7 s per 16 token, RssAnon 33.025 MiB. cap 128 → **61,5 %** (28599/17933), expert-read **1031**, TTFT 118,8 s, **128,2 s** (il minimo della curva), RssAnon 40.226 MiB. cap 192 → **71,4 %** (33225/13307) ma ⚠️ **tempi invalidi**: RssAnon 49.672 MiB su 60 GB, swap di sistema fino a 22,4 GiB, e `expert-read` che *sale* a **2192 ms** mentre i miss si dimezzano — sintomo inequivocabile di thrashing, non di cache. **Mmap** (`COLI_MAP_EXPERTS=1`, che dà il tempo pulito a 192 perché tiene l'anonimo piatto): N128 → 61,5 %, TTFT 125,7 s, **135,4 s**, expert-read **32,5 ms**, routed-expert 3921, RssAnon **12.282** MiB + RssFile 37.772, picco swap 2,3 GiB. N192 → 71,4 %, TTFT 122,7 s, **137,4 s**, expert-read 34,9 ms, routed-expert 4031, RssAnon **13.314** MiB + RssFile 39.864, picco swap 8,6 GiB. **Tre letture.** (1) *Il hit rate è path-independent*: M128/N128 danno 28599/17933 identici, M192/N192 33225/13307 identici — è una grandezza logica (slot × politica), il percorso cambia solo i tempi. (2) *Mmap sposta il costo del fault fra i contatori, non lo elimina*: `expert-read` crolla 1031 → 32 ms ma `routed-expert` sale 2466 → 3921, e il totale è praticamente lo stesso (128,2 vs 135,4 s) — il page fault ora si paga dentro il matmul. Il suo valore vero è **l'anonimo**: 12-13 GiB contro 40-49, cioè la differenza fra girare e swappare. (3) *La curva ha risposto alla domanda per cui esisteva*. A cap 128: `resident-mm` 58,4 s + `deltanet` 39,1 s + `expert-read` 16,5 s su 128,2 → **disco 13 %, denso 76 %**, con il pavimento denso **piatto** (3657/3654/3652 ms/fwd a cap 64/128/192). Il disco non è più il collo di bottiglia: azzerarlo del tutto vale ~13 %, e oltre cap 128 un GiB liberato vale **zero** (N128 135,4 vs N192 137,4 s con +10 punti di hit rate). ⇒ **Fase 2 (VRAM) prima di Fase 1 (int4)**, l'ordine opposto a quello che il piano lasciava aperto: l'int4 comprerebbe RAM e hit rate, cioè il 13 % che resta; solo la GPU attacca il 76 %. Fase 0 **completa**. |
 | 08/09 | **0.3 — curva col prompt lungo** (274 token + 16 decode = 290 forwards, stessa selezione dei 3 run: 46532 eventi; il prompt corto lasciava il decode fermo perché il working set ~118/layer non churnava): cap 16 → **7,5 %** (hit 3509 / miss 43023), expert-read **2601 ms/fwd**, decode **10,0 s/tok**, TTFT 148 s. cap 32 → **10,2 %**, expert-read 2307, decode 9,6 s/tok, TTFT 143 s. cap 64 → **26,8 %** (12486/34046), expert-read **1886**, decode **9,2 s/tok**, TTFT 136 s. Il gradiente ora muove il decode: 16→64 = −27,5 % di disco. Asimmetria forte: +2,7 punti da 16→32 ma **+16,6 da 32→64** → la popolarità degli esperti è skewed, gli slot marginali 32-64 sono caldi: 128/192 dovrebbero pagare ancora (da confermare nella finestra K12). **Due fatti architetturali**: (1) `routed-expert` a 2692-2752 ms/fwd, 6,7× più lento che col prompt corto (408) → il matmul esperti non è FLOP-bound ma **bandwidth-bound sulle pagine appena faultate** (4,7 MiB nuovi a esperto, zero locality): VRAM-residenza (Fase 2) e cap alto attaccano la stessa radice; (2) prefetch cala sotto il 100 % sotto carico (78936/86046 → 55416/68092 = 81-92 %) → parte dei miss diventa síncrona. TTFT 136-148 s su prefill 274 a working set freddo (~16-17k esperti unici, 56-80 GiB di disco): questo è il cold-start reale del prompt lungo su questa macchina. PEAK RSS invariato (14,68/18,19/25,22 GB) |
 | 08/09 | **0.3 parziale — curva hit-rate, gradini 16/32/64** (stesso prompt 28+16, 43 forwards, percorso copia, 12 thread; working set del run: 5687 esperti distinti = ~118/layer). cap 16 (768 slot): **22,4 %** (hit 2677 / miss 9252), 0,65 tok/s, TTFT 13,3 s, PEAK 14,62 GB. cap 32 (1536): **32,5 %** (3871/8058), 0,61 tok/s, TTFT 15,2 s, PEAK 18,14 GB. cap 64 (3072): **41,3 %** (4928/7001), 0,63 tok/s, TTFT 15,3 s, PEAK 25,17 GB. Gains +10,1 poi +8,8 punti per raddoppio — decrescenti ma vivi; I/O coerente (weight-ranges 18504→16116→14002, prefetched 100 %, batch 1021→828→649). **Lettura**: con 43 forwards il working set per layer (~118 esperti) sta SOTTO cap 192 (192 slot/layer) → a 192 questo prompt arriverebbe a ~70-75 % di hit rate (mancano solo i 5687 primi contatti); su prompt lunghi il working set per layer cresce fino a 512 e la curva va ri-misurata. Decode flat 0,61-0,65 tok/s a questi cap: a 43 forwards il hit rate incide su TTFT/cold-start, non sul decode (disco ~0,5 s su 1,6). 96/128/192: finestra K12 a riposo (comunica il titolare) |
 | 08/09 | **0.2 chiuso — scomposizione per token di decode** (cap 32, 12 thread, prompt 28 + 16 nuovi, 16 forwards; stessa riga I/O in tutti i run: weight-ranges 16116, coalesced-gate-up 8058, prefetched 16116 = 100 %, parallel-batches 828, resident-scales 28,12 MiB; hit rate 32,5 % = hit 3871 / miss 8058, 5687 esperti distinti di 25088). Copia, steady state: expert-read **498 ms**, routed-expert 408, shared 40, resident-mm 561 (sovrapposto), deltanet 378, qsa 0,3+4,7, ple 6,2, lm-head 38,2 ms/fwd → **1,64 s/token** (0,61 tok/s), TTFT 15,3 s (prefill 28), RssAnon picco **18,1 GiB** (RssFile ~0). Mappatura sui 4 termini del piano: disco ≈ 498 ms (36 %), expert-matmul ≈ 448 ms (33 %), attention ≈ 382 ms (28 %), lm-head ≈ 38 ms (3 %). **vs recon 96/17/14/2,6 s (disco 69 %)**: stessa fase n.1 a disco freddo, quote molto diverse — 990 PRO + prefetch al 100 % + gate-up coalesced = ~0,5 s/token di disco, ~30× meno del box di riferimento; le fasi CPU (matmul + deltanet + dense) diventano la quota visibile. Conseguenza: su questa macchina la Fase 2 deve attaccare il matmul CPU (routed+resident ≈ 1,38 s/fwd sovrapposto), non solo il disco; il disco resta il problema di TTFT/cold-start (11,5–15,4 s) |
