@@ -102,6 +102,61 @@ int main(void)
     }
     env_unset("COLI_NO_OMP_TUNE");
 
+    /* Sibling policy (qwen38): keep SMT, reserve two whole physical cores.
+     * Same three contract points, opposite sizing. The floor at `physical`
+     * means a non-SMT host must come out exactly where the other policy
+     * leaves it, which is why `want` collapses to `logical` there. */
+    env_unset("OMP_NUM_THREADS");
+    env_unset("COLI_NO_OMP_TUNE");
+    omp_set_num_threads(logical);
+    coli_omp_tune_threads_smt("test", 2);
+    got = omp_get_max_threads();
+    want = logical;
+    if (physical > 0 && physical < logical) {
+        want = logical - 2 * (logical / physical);
+        if (want < physical) want = physical;
+    }
+    if (got != want) {
+        fprintf(stderr, "smt sizing: got %d threads, want %d (physical=%d logical=%d)\n",
+                got, want, physical, logical);
+        fail = 1;
+    }
+    if (got > logical) {
+        fprintf(stderr, "smt sizing oversubscribed: %d > %d logical\n", got, logical);
+        fail = 1;
+    }
+    if (physical > 0 && got < physical) {
+        fprintf(stderr, "smt sizing fell below the physical-core floor: %d < %d\n",
+                got, physical);
+        fail = 1;
+    }
+
+    /* reserve_cores = 0 must be a no-op, not a resize to `logical`. */
+    omp_set_num_threads(sentinel);
+    coli_omp_tune_threads_smt("test", 0);
+    if (omp_get_max_threads() != sentinel) {
+        fprintf(stderr, "smt sizing with a zero reserve was not a no-op\n");
+        fail = 1;
+    }
+
+    omp_set_num_threads(sentinel);
+    env_set("OMP_NUM_THREADS", "7");
+    coli_omp_tune_threads_smt("test", 2);
+    if (omp_get_max_threads() != sentinel) {
+        fprintf(stderr, "smt sizing ignored an explicit OMP_NUM_THREADS\n");
+        fail = 1;
+    }
+    env_unset("OMP_NUM_THREADS");
+
+    omp_set_num_threads(sentinel);
+    env_set("COLI_NO_OMP_TUNE", "1");
+    coli_omp_tune_threads_smt("test", 2);
+    if (omp_get_max_threads() != sentinel) {
+        fprintf(stderr, "smt sizing ignored the COLI_NO_OMP_TUNE kill switch\n");
+        fail = 1;
+    }
+    env_unset("COLI_NO_OMP_TUNE");
+
     if (fail) {
         puts("test_omp_tune: FAIL");
         return 1;

@@ -1939,9 +1939,9 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
          * to the grouped-W4 path below — 3 launches for the whole group instead
          * of 4 per expert (#431: the launch flood measured at ~981 micro-kernels
          * per token came from decode riding this branch's per-expert fallback). */
-        /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
-         * contrario del path W4A4), un lancio per expert dentro lo stream —
-         * l'overhead di lancio e' trascurabile rispetto ai GEMM. */
+        /* W4A16 Tensor Core per group: fp16 activations per tile (lossless,
+         * unlike the W4A4 path), one launch per expert inside the stream —
+         * the launch overhead is negligible next to the GEMMs. */
         int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
         int off16=0;
         for(int c=0;c<count;c++){
