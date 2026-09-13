@@ -1,0 +1,168 @@
+/* qwen38_tier.h -- optional CUDA VRAM expert tier for the qwen38 engine.
+ *
+ * Same concept as qwen36_tier.h ("route -> place -> overlap -> learn"): the
+ * hot experts are promoted into DEVICE_LOCAL VRAM across one or more GPUs and
+ * computed there through the existing expert-group API of backend_cuda.cu.
+ * One home device per expert (eid % n_gpus), LFRU heat with hysteresis from
+ * tier.h, uploads on a background thread through staging copies.
+ *
+ * THE CONSTRAINT IS INVERTED WITH RESPECT TO qwen36_tier.h.
+ *
+ * That tier demands cap_experts_per_layer == n_experts and keeps raw
+ * pointers inside the RAM slots, which therefore must never be evicted:
+ * with total residency guaranteed it can go fetch the weights itself, and
+ * in fact warmstart, lookahead and LFRU swap run without ever calling back
+ * into the engine. Here total residency does not exist and cannot exist:
+ * the qwen38 experts live on disk (185 GB on a 64 GB machine) and the slots
+ * ARE an LRU cache with eviction -- worse, with COLI_MAP_EXPERTS=1 (the
+ * fastest default, measured at 1.18 vs 1.64 s/token) the slot does not even
+ * own the bytes, it POINTS into a file mapping the kernel can unmap under
+ * one's feet. A pointer kept here would dangle within a few tokens.
+ *
+ * From which the two interface differences:
+ *
+ *  1. The tier OWNS its copy in VRAM and never remembers a RAM address.
+ *     Between the staging copy and the upload there is no dependency on the
+ *     slot that originated it: that one can be evicted right after.
+ *
+ *  2. The tier cannot read the disk, so it cannot promote on its own. It
+ *     ASKS (q38t_plan_fill) and awaits an OFFER: the engine, which knows how
+ *     to pread, loads the expert and passes it with q38t_offer(). The same
+ *     holds for hot promotions -- it offers what it just loaded for a miss,
+ *     which is exactly the moment the bytes are in hand.
+ *
+ * In exchange the format is a gift: qwen38 is native FP8 and with
+ * native_fp8 on the slot already holds raw e4m3 with a scale per 128x128
+ * block (q38_load_native_fp8_ranges), i.e. **exactly** the fmt=8 that
+ * backend_cuda.cu loads (:1412) and that the grouped_hidden_f8w_dual /
+ * grouped_down_f8w kernels (:933,:968) chew. The staging is a memcpy, not
+ * a conversion: no XOR nibble like in qwen36_tier.c:63, no expansion. The
+ * BF16/F32 expansion branch of q38_load_fp8_expert_weight only concerns
+ * native_fp8 off, and there the tier stays still (see q38t_init).
+ *
+ * The main gain is not the matmul: it is that a VRAM hit does NOT touch the
+ * disk. The engine notes the routing for all K, issues the residents and
+ * loads into RAM only the missing ones. With ~4.69 MiB per expert
+ * (3*2560*640 bytes plus 300 scales) and a ~29 GB budget on two 16 GB
+ * cards, about 6,300 of the 24,576 experts fit in VRAM: that fraction of
+ * misses disappears from the expert-read path, which Phase 0.3 showed to be
+ * the dominant cost.
+ *
+ * Order of use in decode (S=1):
+ *
+ *      q38t_note(layer, idx, K);                     // heat, all K
+ *      uint32_t m = q38t_issue(layer, idx, K, xs);   // issues the residents
+ *      for (k not in m) { slot = q38_expert_get(...); ...CPU...;
+ *                         q38t_offer(layer, idx[k], slot...); }
+ *      q38t_take(m, route_gates, K, ys);             // accumulates the residents
+ *
+ * The qwen38 prefill is already in expert-group form (rows grouped per
+ * expert, three matmuls per group) and could use synchronous
+ * coli_cuda_expert_group(), which does not have the row ceiling of the
+ * asynchronous issue; it is not yet exposed here, it comes after measuring
+ * decode.
+ *
+ * Activation: COLI_CUDA=1 [COLI_GPUS=0,1] [CUDA_EXPERT_GB=<G>|auto]
+ * [HEAT_FILE=<path>] [Q38T_NO_WARMSTART=1]. Compiled only when the build
+ * defines -DCOLI_CUDA (CUDA=1); otherwise the inline stubs below keep the
+ * engine on CPU at zero cost, as qwen36_tier.h does. */
+#ifndef QWEN38_TIER_H
+#define QWEN38_TIER_H
+#include <stdint.h>
+
+#ifdef COLI_CUDA
+
+/* Init after the model load, before the first token. Returns 1 if the tier
+ * is active. It does NOT ask for the RAM cache capacity: the slots can be
+ * evicted as much as they want, and that is the reason this tier exists in
+ * a different shape than the other. Refuses (returns 0, the engine stays on
+ * CPU) if native_fp8 is off: without native FP8 the slot holds expanded F32,
+ * four times larger and in a format the fmt=8 kernels do not read.
+ * scale_count is fp8_nblk(hidden)*fp8_nblk(inter), i.e. how many float the
+ * scales of ONE of the three matrices are worth -- the engine already
+ * computed it for its per-layer scale bank. */
+int  q38t_init(int n_layers, int n_experts, int hidden, int inter, int topk,
+               int scale_count, int native_fp8);
+int  q38t_ready(void);
+int  q38t_is_resident(int layer, int eid);
+void q38t_shutdown(void);
+
+/* Heat of the K experts routed for this token. Must be called BEFORE
+ * q38t_issue and before deciding what to load: an expert resident in VRAM
+ * never passes through q38_expert_get, so this is the only point where the
+ * tier sees it pass. Queues nothing and does not touch the disk. */
+void q38t_note(int layer, const int *eids, int K);
+
+/* Offer: the engine has this expert's bytes in hand right now (it just
+ * served a miss, or it is running a warmstart plan). The tier decides
+ * whether it is worth VRAM, and if so copies to staging IMMEDIATELY -- on
+ * return the caller can evict the slot, mapped or not.
+ *
+ *   gate,up,down: raw e4m3, [inter,hidden], [inter,hidden], [hidden,inter];
+ *                 in the native cache they are the three Slot.gate/up/down
+ *                 pointers (contiguous in the slab when the copy is active,
+ *                 scattered in three mappings when COLI_MAP_EXPERTS=1: it is
+ *                 not assumed they are).
+ *   scales:       3*scale_count float [gate|up|down], i.e. this expert's
+ *                 slice inside the layer's scale bank.
+ *
+ * planned = 1 when the expert comes from q38t_plan_fill (budget already
+ * reserved at that moment); 0 for a spontaneous hot offer, which must still
+ * earn its place. */
+void q38t_offer(int layer, int eid,
+                const uint8_t *gate, const uint8_t *up, const uint8_t *down,
+                const float *scales, int planned);
+
+/* Issues the GPU groups for the resident subset of the K selected experts
+ * (asynchronous, all devices in parallel). Returns the mask of the k taken
+ * on by the GPU: those compute themselves while the CPU does the missing
+ * ones. Then q38t_take().
+ *
+ * Note on the row ceiling: coli_cuda_expert_group_issue refuses more than 8
+ * total rows per device (backend_cuda.cu:2091, "decode-scale only"). qwen38
+ * has topk=10, and the home-device split (eid % n_gpus) usually leaves ~5
+ * rows per card; but nothing forbids ten experts all landing on the same
+ * one. Splitting the issue is not an option -- the backend admits a single
+ * issue in flight per device, and a second one would require the take of
+ * the first, i.e. precisely the synchronization the asynchrony was meant to
+ * avoid. The extras therefore stay on the CPU via the mask, like the non
+ * residents: never a wrong result, at most a slower token. The row-overflow
+ * counter in q38t_stats tells whether the case actually happens. */
+uint32_t q38t_issue(int layer, const int *eids, int K, const float *x);
+
+/* Gathers the GPU results and accumulates val[k]*y_k into out[hidden]. Must
+ * be called after every issue that returned a non-null mask, even if in the
+ * meantime the CPU did everything else. */
+void q38t_take(uint32_t mask, const float *val, int K, float *out);
+
+/* Warmstart: the tier plans the set to fill (heat order, budget reserved
+ * immediately) and hands it over; the engine loads each expert and returns
+ * it with q38t_offer(..., planned=1), from as many threads as it wants.
+ * q38t_fill_wait() blocks until the upload queue is empty. */
+int  q38t_plan_fill(int *layers, int *eids, int max);
+/* Returns the budget reserved for a planned expert that the engine then
+ * decided not to load (outside its layer range, unexpected format). Without
+ * it, that VRAM would stay booked by nobody forever. */
+void q38t_cancel_plan(int layer, int eid);
+void q38t_fill_wait(void);
+
+/* Un blocco di telemetria su stderr: residenza, hit/miss, upload per device. */
+void q38t_stats(void);
+
+#else /* !COLI_CUDA: stub inline, the engine stays CPU-only */
+
+static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  q38t_ready(void){return 0;}
+static inline int  q38t_is_resident(int a,int b){(void)a;(void)b;return 0;}
+static inline void q38t_shutdown(void){}
+static inline void q38t_note(int a,const int*b,int c){(void)a;(void)b;(void)c;}
+static inline void q38t_offer(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;}
+static inline uint32_t q38t_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline void q38t_take(uint32_t a,const float*b,int c,float*d){(void)a;(void)b;(void)c;(void)d;}
+static inline int  q38t_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
+static inline void q38t_cancel_plan(int a,int b){(void)a;(void)b;}
+static inline void q38t_fill_wait(void){}
+static inline void q38t_stats(void){}
+
+#endif /* COLI_CUDA */
+#endif /* QWEN38_TIER_H */

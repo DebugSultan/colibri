@@ -1029,11 +1029,29 @@ endif
 qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
-# Qwen3.8-Flash-Next text-only sibling. This target is intentionally CPU-only;
-# qwen38.c owns the direct checkpoint loader and SERVE=1 protocol, with no
-# CUDA/Metal tier advertised by the control plane.
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h
-	$(CC) $(NOCUDA_CFLAGS) qwen38.c -o qwen38$(EXE) $(NOCUDA_LDFLAGS)
+# Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
+# loader and SERVE=1 protocol. Same switch as qwen36 and for the same
+# reason: with CUDA=1 the optional VRAM tier (qwen38_tier.c) comes in, without
+# it the build stays CPU-only on the inline stubs of qwen38_tier.h, and the
+# NOCUDA_* flags keep `make qwen38` from depending on a toolkit it does not
+# touch.
+#
+# The tier is, however, a distant relative of qwen36_tier.c: there total
+# residency in RAM is a prerequisite and the tier takes the weights on its
+# own; here the experts live on disk (185 GB on 64 GB of RAM) and the RAM
+# cache evicts, so it is the engine that offers them to it. The details are
+# in the header of qwen38_tier.h.
+ifeq ($(CUDA),1)
+QWEN38_TIER_SRC = qwen38_tier.c
+QWEN38_CFLAGS   = $(CFLAGS)
+QWEN38_LDFLAGS  = $(LDFLAGS)
+else
+QWEN38_TIER_SRC =
+QWEN38_CFLAGS   = $(NOCUDA_CFLAGS)
+QWEN38_LDFLAGS  = $(NOCUDA_LDFLAGS)
+endif
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_tier.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN38_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN38_CFLAGS) qwen38.c $(QWEN38_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN38_LDFLAGS)
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
