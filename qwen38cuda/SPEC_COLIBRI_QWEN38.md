@@ -110,7 +110,7 @@ architetturale che rende il modello eseguibile.
 
 Sorgenti letti: `c/qwen38.c`, `c/qwen38_core.h`, `c/st.h`, `c/expert_store.h`,
 `c/backend_cuda.cu`, `c/qwen36_tier.h`, `c/Makefile`.
-Clone locale: `/home/sultano/colibri`, branch `main`, HEAD `fd93c41`.
+Clone locale di upstream, branch `main`, HEAD `fd93c41`.
 ⚠️ È il **clone upstream JustVugg**, non il fork `DebugSultan/qwen38cuda`.
 
 ### 2.1 Il percorso degli esperti
