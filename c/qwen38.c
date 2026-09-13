@@ -31,6 +31,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include "omp_tune.h"
 
 /* Hard context ceiling: the model's max_position_embeddings. Every buffer that
  * scales with position (KV cache, attention score row) is allocated from max_t,
@@ -1641,6 +1642,20 @@ int main(int argc, char **argv) {
     int serve_mode=getenv("SERVE")&&getenv("SERVE")[0]=='1';
 
     fprintf(stderr, "== Qwen3.8-Flash-Next native text engine | cache=%d/layer | CPU ==\n", cap);
+
+    /* Squadra OpenMP: SMT INCLUSA, due core fisici riservati. Al contrario
+     * degli altri motori, che si dimensionano sui core fisici. Il perche' e la
+     * misura che lo autorizza stanno in omp_tune.h, sopra questa funzione: qui
+     * il tempo e' denso-dominato e bandwidth-bound sulle pagine appena faultate
+     * (76% fra resident-mm e deltanet), non compute-bound su pesi residenti,
+     * quindi il fratello SMT copre latenza invece di contendere l'unita'
+     * vettoriale. Sul 3900X di riferimento: 20 thread su 24, -25,5%.
+     *
+     * Va qui e non nel launcher perche' `coli` esenta qwen38 dal suo default
+     * a core fisici (c/coli, blocco COLI_NO_OMP_TUNE) proprio per lasciare la
+     * politica a questo runtime -- stessa forma dell'esenzione di deepseek_v4.
+     * Serve percio' anche ai lanci diretti, che sono quelli dei benchmark. */
+    coli_omp_tune_threads_smt("qwen38", 2);
 
     int is_ref=q38_reference_mode(refpath,serve_mode);
 

@@ -164,4 +164,74 @@ static void coli_omp_tune_threads(const char *engine)
 #endif
 }
 
+/* Dimensiona la squadra TENENDO l'SMT, meno una riserva di core fisici interi.
+ * Politica OPPOSTA a coli_omp_tune_threads() qui sopra, e opposta per una
+ * ragione misurata, non per gusto: le due servono due regimi diversi.
+ *
+ *   core fisici   il regime di #718: GEMV int4 su pesi gia' residenti. Le
+ *                 regioni sono minuscole e back-to-back, due fratelli SMT si
+ *                 contendono la stessa unita' vettoriale e la squadra collassa
+ *                 (2.3x su Zen3).
+ *
+ *   SMT inclusa   il regime di Qwen3.8-Flash-Next: matmul FP8 degli esperti su
+ *                 pagine APPENA FAULTATE dal disco. Il collo e' la banda verso
+ *                 la memoria, non l'unita' vettoriale, e li' il fratello SMT
+ *                 non contende: copre la latenza dell'altro.
+ *
+ * La misura che autorizza questo (campagna qwen38, Fase 0.4 del 13/09/2026;
+ * verbale in qwen38cuda/PIANO_NEXT.md §9). Ryzen 9 3900X 12C/24T, 64 GB, cap
+ * 128, prompt 274 token + 16 nuovi = 290 forward, ogni gradino ripetuto:
+ *
+ *   OMP_NUM_THREADS   16 token (copia)   resident-mm   deltanet
+ *     12 (fisici)        128,5 s          3648 ms/fwd   2440 ms/fwd
+ *     16                 109,9 s          2792          1974
+ *     20                  95,7 s  -25,5%  2296  -37,1%  1661  -31,9%
+ *
+ * L'efficienza di scaling resta ~97% fino a 20: nessuna saturazione, che e'
+ * per l'appunto la firma del regime bandwidth-bound. `expert-read` (disco)
+ * resta piatto, 1108 -> 1087 ms/fwd: il guadagno e' tutto nel denso CPU.
+ *
+ * PERCHE' UNA RISERVA, E PERCHE' IN CORE INTERI.
+ * Il gradino a 24 non e' stato misurato: escluso dal titolare perche' su questo
+ * nodo gira un servizio di produzione accanto, e saturare tutte le CPU logiche
+ * lo affamerebbe. La riserva si conta in core fisici INTERI (entrambi i loro
+ * fratelli SMT) perche' lasciare mezzo core non lascia niente: il fratello
+ * rimasto continua a contendere la stessa unita'. Con reserve_cores=2 su un
+ * 3900X: 24 - 2*2 = 20, che e' il numero misurato sopra.
+ *
+ * PAVIMENTO. Non si scende mai sotto i core fisici, cioe' sotto il default
+ * odierno: su un host senza SMT, o con pochi core, questa funzione non deve
+ * poter peggiorare cio' che c'e' gia'. Vale anche la REGOLA SUI FALLIMENTI in
+ * testa al file: conteggio non determinabile -> si lascia il default di OpenMP.
+ */
+static void coli_omp_tune_threads_smt(const char *engine, int reserve_cores)
+{
+#ifdef _OPENMP
+    if (getenv("COLI_NO_OMP_TUNE")) return; /* stesso kill-switch degli altri */
+    if (getenv("OMP_NUM_THREADS")) return;  /* l'utente comanda */
+    if (reserve_cores < 0) return;
+
+    int phys = coli_physical_cores();
+    if (phys <= 0) return;                  /* sconosciuto -> default di OpenMP */
+    int logical = omp_get_max_threads();
+    /* logical <= phys: niente SMT da sfruttare (oppure una affinity ristretta
+     * che ha gia' deciso per noi). In entrambi i casi non si tocca nulla. */
+    if (logical <= phys) return;
+
+    int per_core = logical / phys;          /* fratelli SMT per core fisico */
+    int team = logical - reserve_cores * per_core;
+    if (team < phys) team = phys;           /* mai sotto il default odierno */
+    if (team >= logical) return;            /* riserva nulla: niente da dire */
+
+    omp_set_num_threads(team);
+    fprintf(stderr, "[OMP] %s: %d threads (SMT inclusa) su %d CPU logiche, "
+                    "%d core fisici riservati; il matmul FP8 degli esperti e' "
+                    "bandwidth-bound e l'SMT paga (Fase 0.4: -25,5%%); "
+                    "set OMP_NUM_THREADS=<n> to override\n",
+            engine, team, logical, reserve_cores);
+#else
+    (void)engine; (void)reserve_cores;
+#endif
+}
+
 #endif /* COLI_OMP_TUNE_H */

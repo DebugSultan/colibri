@@ -451,18 +451,30 @@ def env_for_engine(a, arch, plan=None):
     # override and bypass its loader-aware policy. The other engines still
     # need the physical-core default below.
     #
+    # Qwen3.8 is the second exception, same shape and same reason: its runtime
+    # calls coli_omp_tune_threads_smt(), which KEEPS SMT and reserves two whole
+    # physical cores instead. Its time is dominated by FP8 expert matmuls over
+    # freshly faulted pages -- bandwidth-bound, where the SMT sibling covers
+    # latency rather than contending for the vector unit; that is a different
+    # regime from the resident int4 GEMV of #718. Measured 13/09/2026 on a
+    # 3900X (12C/24T), cap 128, 290 forwards: 12 -> 20 threads is -25,5% on 16
+    # tokens, -37,1% on resident-mm. A setdefault of the physical count here is
+    # indistinguishable from a user override inside the engine (the runtime
+    # yields to any OMP_NUM_THREADS it finds set) and would pin it back to 12.
+    # Rationale, table and the reserve-whole-cores argument: c/omp_tune.h.
+    #
     # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
-        if arch != "deepseek_v4":
-            from resource_plan import physical_cpu_count
-            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        else:
+        if arch == "deepseek_v4":
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
             env.setdefault("OMP_DYNAMIC", "FALSE")
             if sys.platform != "win32":
                 env.setdefault("OMP_PROC_BIND", "close")
                 env.setdefault("OMP_PLACES", "cores")
+        elif arch != "qwen38":
+            from resource_plan import physical_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
     env["NGEN"] = str(ngen_for(a, family=arch))
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
     if arch == "olmoe":

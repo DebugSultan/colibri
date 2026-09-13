@@ -116,6 +116,28 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_qwen38_is_exempt_from_the_physical_core_default(self):
+        """qwen38 sizes its own OpenMP team and must reach the engine with
+        OMP_NUM_THREADS unset.
+
+        Its runtime keeps SMT and reserves two whole physical cores
+        (coli_omp_tune_threads_smt, c/omp_tune.h): FP8 expert matmuls over
+        freshly faulted pages are bandwidth-bound, not the resident int4 GEMV
+        of #718 -- measured -25,5% going 12 -> 20 threads on a 12C/24T host.
+        A setdefault here is indistinguishable from a user override inside the
+        engine, which yields to any OMP_NUM_THREADS it finds set, so it would
+        silently pin the team back to the physical count. Same exemption shape
+        as deepseek_v4, whose own runtime is loader-aware.
+        """
+        args = argparse.Namespace(ngen=8, temp=0.0, ram=0, ctx=0)
+        with mock.patch("resource_plan.physical_cpu_count", return_value=8):
+            env = self.cli.env_for_engine(args, "qwen38")
+            self.assertNotIn("OMP_NUM_THREADS", env)
+            # ...while a sibling engine still gets it: this is an exemption,
+            # not the removal of the default.
+            self.assertEqual(
+                self.cli.env_for_engine(args, "kimi")["OMP_NUM_THREADS"], "8")
+
     def test_kimi_engine_environment_forwards_ram(self):
         """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
         K3 it was set and never read -- the flag a user reaches for to bound
