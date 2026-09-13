@@ -1030,15 +1030,17 @@ qwen36$(EXE): qwen36.c serve_poll.h cli_args.h qwen36_tier.h st.h json.h compat.
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Qwen3.8-Flash-Next text-only sibling. qwen38.c owns the direct checkpoint
-# loader and SERVE=1 protocol. Stesso interruttore di qwen36 e per la stessa
-# ragione: con CUDA=1 entra il tier VRAM opzionale (qwen38_tier.c), senza resta
-# CPU-only sugli stub inline di qwen38_tier.h, e i flag NOCUDA_* evitano che
-# `make qwen38` dipenda da un toolkit che non tocca.
+# loader and SERVE=1 protocol. Same switch as qwen36 and for the same
+# reason: with CUDA=1 the optional VRAM tier (qwen38_tier.c) comes in, without
+# it the build stays CPU-only on the inline stubs of qwen38_tier.h, and the
+# NOCUDA_* flags keep `make qwen38` from depending on a toolkit it does not
+# touch.
 #
-# Il tier e' pero' un parente lontano di qwen36_tier.c: li' la residenza totale
-# in RAM e' un prerequisito e il tier si prende i pesi da solo, qui gli esperti
-# stanno su disco (185 GB su 64 di RAM) e la cache RAM sfratta, quindi e' il
-# motore a offrirglieli. Il dettaglio sta in testa a qwen38_tier.h.
+# The tier is, however, a distant relative of qwen36_tier.c: there total
+# residency in RAM is a prerequisite and the tier takes the weights on its
+# own; here the experts live on disk (185 GB on 64 GB of RAM) and the RAM
+# cache evicts, so it is the engine that offers them to it. The details are
+# in the header of qwen38_tier.h.
 ifeq ($(CUDA),1)
 QWEN38_TIER_SRC = qwen38_tier.c
 QWEN38_CFLAGS   = $(CFLAGS)
