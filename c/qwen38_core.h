@@ -9,6 +9,10 @@
 #ifndef COLI_QWEN38_CORE_H
 #define COLI_QWEN38_CORE_H
 
+/* Tier VRAM opzionale. Senza -DCOLI_CUDA sono stub inline che non costano
+ * nulla, quindi il percorso CPU resta quello di prima riga per riga. */
+#include "qwen38_tier.h"
+
 #define Q38_MAX_LAYERS 512
 #define Q38_MAX_EXPERTS 1024
 #define Q38_MAX_TOPK 256
@@ -133,6 +137,12 @@ typedef struct {
     int ple_history_len;
     int range_begin, range_end;
     int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads;
+    /* 1 se il tier VRAM ha accettato QUESTO modello. Non si usa
+     * q38t_ready() perche' e' un singleton di processo: in un contesto
+     * multi-modello (adapter Segment) il secondo init viene rifiutato ma
+     * ready() continua a dire 1, e quel modello finirebbe a calcolare
+     * sugli slot dimensionati per la geometria del primo. */
+    int tier;
     int prefill_batch;
     uint64_t resident_weight_bytes;
     double dense_load_s;
@@ -877,6 +887,13 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     if(load_boundaries&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);
     if(allocate_state) q38_alloc_state(m);
     m->dense_load_s=now_s()-t0;
+    /* Il tier decide da se' se accendersi (COLI_CUDA=1, GPU visibili, FP8
+     * nativo); se dice di no il motore prosegue su CPU senza saperlo. Le scale
+     * di UNA matrice sono fp8_nblk(inter)*fp8_nblk(hidden), lo stesso conto che
+     * q38_prepare_expert_scale_bank fa per la sua bank. Qui non si promuove
+     * niente: a questo punto nessun esperto e' ancora stato letto. */
+    m->tier=q38t_init(c->layers,c->experts,c->hidden,c->inter,c->topk,
+                      (int)(fp8_nblk(c->inter)*fp8_nblk(c->hidden)),m->native_fp8);
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
                    "FP8=%s, BF16=%s (resident matrices %.2f GiB)\n",m->prefix,c->layers,c->ple_layer,cap,
                    m->native_fp8?"native":"expanded-f32",m->native_bf16?"native":"expanded-f32",
@@ -1248,6 +1265,42 @@ static Slot *q38_expert_get(Model *m,int layer,int eid) {
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
     }
     s->eid=-1;q38_load_expert(m,layer,eid,s);s->eid=eid;s->used=++m->clock;lc->by_expert[eid]=(int)(s-lc->slots);return s;
+}
+
+/* Warmstart del tier VRAM. Non puo' stare in model_init_range: li' nessun
+ * esperto e' ancora caricato (e' un'invariante del motore, non un caso), e il
+ * tier non sa leggere il disco. Quindi il piano lo fa lui e la lettura la fa
+ * qui il motore, a blocchi, riusando la stessa cache LRU del decode -- gli
+ * slot vengono sfrattati subito dopo l'offerta, ed e' esattamente cio' per cui
+ * l'offerta copia in staging invece di conservare il puntatore.
+ *
+ * Senza HEAT_FILE q38t_plan_fill torna 0 al primo colpo e non si legge niente:
+ * a freddo non esiste un ordine sensato da inventare, e la promozione a caldo
+ * del decode fa gia' il lavoro. */
+static void q38_tier_warmstart(Model *m) {
+    if(!m->tier) return;
+    enum { BATCH=64 };
+    int layers[BATCH],eids[BATCH],n,total=0;
+    double t0=now_s();
+    while((n=q38t_plan_fill(layers,eids,BATCH))>0){
+        for(int i=0;i<n;i++){
+            /* Un piano non eseguito va disdetto: plan_fill ha gia' riservato
+             * il budget, e senza la disdetta quella VRAM resterebbe prenotata
+             * da nessuno per tutta la vita del processo. */
+            if(layers[i]<m->range_begin||layers[i]>=m->range_end){
+                q38t_cancel_plan(layers[i],eids[i]); continue; }
+            Slot *ex=q38_expert_get(m,layers[i],eids[i]);
+            if(ex->gate.kind!=Q38_WEIGHT_FP8||!ex->gate.scales){
+                q38t_cancel_plan(layers[i],eids[i]); continue; }
+            q38t_offer(layers[i],eids[i],(const uint8_t*)ex->gate.data,
+                       (const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
+                       ex->gate.scales,1);
+            total++;
+        }
+        q38t_fill_wait();
+    }
+    if(total) fprintf(stderr,"[qwen38] tier warmstart: %d experts in %.1f s\n",
+                      total,now_s()-t0);
 }
 
 typedef struct {
@@ -1664,21 +1717,44 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
-        q38_prefetch_native_fp8_experts(m,layer,idx,K);
+        /* Il tier vede il routing di TUTTI i K: un esperto residente in VRAM non
+         * passa mai da q38_expert_get, quindi questo e' l'unico punto in cui il
+         * suo calore puo' essere contato. Poi lancia i residenti e torna la
+         * maschera dei k che si calcolano da soli sulla GPU: quelli spariscono
+         * dal prefetch e dal batch, ed e' li' che sta il guadagno vero -- non
+         * nel matmul, ma nei ~4,7 MiB di disco che non vengono piu' letti. Con
+         * il tier spento gmask resta 0, need[] ridiventa idx[] e il percorso e'
+         * quello di prima, riga per riga. */
+        uint32_t gmask=0;
+        if(m->tier){ q38t_note(layer,idx,K); gmask=q38t_issue(layer,idx,K,xs); }
+        int need[Q38_MAX_TOPK],need_z[Q38_MAX_TOPK],nn=0;
+        for(int z=0;z<K;z++) if(!((gmask>>z)&1u)){ need[nn]=idx[z]; need_z[nn]=z; nn++; }
+        if(nn) q38_prefetch_native_fp8_experts(m,layer,need,nn);
         double phase_started=now_s();
         q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
         for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
         Slot *selected[Q38_MAX_TOPK];
-        int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
-        for(int z=0;z<K;z++){
-            Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
+        int loaded_batch=nn?q38_expert_get_batch(m,layer,need,nn,selected):0;
+        for(int n=0;n<nn;n++){
+            int z=need_z[n];
+            Slot *ex=loaded_batch?selected[n]:q38_expert_get(m,layer,need[n]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            /* Offerta: i byte sono in mano ADESSO. Il tier copia subito in
+             * staging, quindi lo slot puo' essere sfrattato al giro dopo --
+             * cosa che con COLI_MAP_EXPERTS=1 smonterebbe anche la mappatura. */
+            if(m->tier&&ex->gate.kind==Q38_WEIGHT_FP8&&ex->gate.scales)
+                q38t_offer(layer,need[n],(const uint8_t*)ex->gate.data,
+                           (const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
+                           ex->gate.scales,0);
         }
+        /* Dopo il lavoro CPU: la take sincronizza, e prima di qui la GPU ha
+         * macinato in parallelo allo shared expert e ai miss. */
+        if(gmask) q38t_take(gmask,route_gates,K,ys);
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
     }
     rt_trace_end();
@@ -2041,6 +2117,7 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
+    if(m->tier){ q38t_stats(); q38t_shutdown(); m->tier=0; }
     for(int i=0;i<m->c.layers;i++) {
         if(m->L)q38_layer_free(&m->L[i]);
         if(m->cache) {

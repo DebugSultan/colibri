@@ -1751,6 +1751,10 @@ int main(int argc, char **argv) {
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+    /* Solo qui e non nell'adapter Segment: quello apre con cap=1 e ridimensiona
+     * dopo, e un tier singleton dentro un contesto multi-modello e' una
+     * decisione a se'. Senza HEAT_FILE questa chiamata non legge nulla. */
+    q38_tier_warmstart(&m);
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts
