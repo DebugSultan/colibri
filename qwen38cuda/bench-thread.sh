@@ -5,11 +5,11 @@
 # non swappa mai, il resto del nodo resta libero di usare zram.
 set -u
 TAG="$1"; THREADS="$2"; PATHMODE="$3"; CAP="${4:-128}"; NOSWAP="${NOSWAP:-0}"
-SCRATCH=/opt/zyonix/backend/colibri-q38-scratch
-ENG=/opt/zyonix/backend/colibri/c/qwen38
+SCRATCH="${SCRATCH:-$(dirname "$0")/../../colibri-q38-scratch}"
+ENG="${ENG:-$(dirname "$0")/../c/qwen38}"
 LOG="$SCRATCH/log-$TAG.txt"
 
-export SNAP=/home/sultano/models/Qwen3.8-Flash-Next-FP8 N_NEW=16 COLI_TIMERS=1 COLI_CUDA=0
+export SNAP="${SNAP:?set SNAP to the model snapshot directory}" N_NEW=16 COLI_TIMERS=1 COLI_CUDA=0
 export OMP_NUM_THREADS="$THREADS"
 export COLI_USAGE="$SCRATCH/usage-$TAG"
 [ "$PATHMODE" = "mmap" ] && export COLI_MAP_EXPERTS=1 || unset COLI_MAP_EXPERTS
