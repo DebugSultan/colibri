@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 #include "qwen38_tier.h"
 #include "backend_cuda.h"
 #include "tier.h"
@@ -51,6 +52,28 @@ static struct {
     uint64_t hits[Q38T_MAX_DEV], miss, uploads, upload_fail;
     uint64_t offers, promotions, swaps, q_full_skips, overflow_rows, take_fails;
     uint64_t tick;
+    /* Hot-path stopwatches. These were added to settle one question -- is the
+     * GPU branch latency-bound or bandwidth-bound? -- and the measured answer
+     * is neither. Over two 128-token runs the whole hot path costs 0.944 s and
+     * 1.006 s against 52.8 s and 58.0 s of routed-expert: 1.8% of it, 0.7% of
+     * wall clock. Both candidate levers are therefore dead, and the numbers
+     * are kept so nobody revives them:
+     *  - take is 8.3 us/call on dev0 and 3.7 us/call on dev1. Since take()
+     *    collects dev0 first, dev0's wait absorbs the common GPU time and
+     *    dev1's figure is its EXCESS over dev0 -- NOT its absolute compute
+     *    time. That excess is nil, so the 2x slower card (dev1 is a 5060 Ti
+     *    at 448 GB/s against dev0's 5070 Ti at 896 GB/s) is not gating the
+     *    pair: both are done while the CPU grinds the non-resident rows. A
+     *    bandwidth-weighted shard instead of eid%2 would buy nothing.
+     *  - issue is the dearest of the three (86 us/call on dev0, 59 on dev1)
+     *    but totals 0.85 s out of 140 s, so batching the 48 per-forward
+     *    issues is worth 0.6% at most.
+     * What remains: the tier's whole win comes from not serving 69% of the
+     * rows on the CPU, and moving them to the GPU is very nearly free. The
+     * decode levers left are residency and the cost of CPU-side rows. */
+    uint64_t t_issue[Q38T_MAX_DEV], t_take[Q38T_MAX_DEV];
+    uint64_t n_issue[Q38T_MAX_DEV], n_take[Q38T_MAX_DEV];
+    uint64_t t_acc;                       /* accumulate loop, pure CPU */
     /* issue state of the (single) decode thread */
     int is_cnt[Q38T_MAX_DEV];
     int is_k[Q38T_MAX_DEV][Q38T_MAX_ROWS];
@@ -63,6 +86,14 @@ static struct {
 
 static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
+
+/* Local clock: the tier does not include qwen38_core.h and should not. In
+ * nanoseconds because the individual calls sit in the microsecond range and a
+ * double of seconds summed tens of thousands of times loses the bottom end. */
+static uint64_t now_ns(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 /* Staging. In qwen36 this function had to bring the two's-complement int4
  * nibbles back to biased binary; here the format in RAM IS already the
@@ -407,7 +438,10 @@ uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
         if(!c) continue;
         float *xr=G.is_x + (size_t)di*Q38T_MAX_ROWS*G.D;
         for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
-        if(!coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr)){
+        uint64_t t0=now_ns();
+        int ok=coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr);
+        G.t_issue[di]+=now_ns()-t0; G.n_issue[di]++;
+        if(!ok){
             for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
             G.is_cnt[di]=0;
         }
@@ -427,7 +461,9 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
     if(mask&&val&&out) for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
         if(!c) continue;
+        uint64_t t0=now_ns();
         const float *y=coli_cuda_expert_group_take(G.dev[di]);
+        G.t_take[di]+=now_ns()-t0; G.n_take[di]++;
         if(!y){
             /* These k were in the mask: the CPU skipped them and now nobody
              * computes them, i.e. the token comes out with a piece of the MoE
@@ -441,11 +477,13 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
             G.is_cnt[di]=0;
             continue;
         }
+        uint64_t t1=now_ns();
         for(int j=0;j<c;j++){
             float w=val[G.is_k[di][j]];
             const float *row=y+(size_t)j*G.D;
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
+        G.t_acc+=now_ns()-t1;
         G.is_cnt[di]=0;
     }
     pthread_mutex_lock(&G.mx);
@@ -539,6 +577,21 @@ void q38t_stats(void){
             (unsigned long long)G.q_full_skips,
             (unsigned long long)G.overflow_rows,
             (unsigned long long)G.take_fails);
+    /* See the stopwatch comment in struct G for how these are read, and in
+     * particular why dev1's t_take is an excess and not an absolute. */
+    uint64_t t_is=0,t_tk=0;
+    for(int i=0;i<G.ndev;i++){ t_is+=G.t_issue[i]; t_tk+=G.t_take[i]; }
+    fprintf(stderr,"[q38tier] hot path: issue %.3f s, take %.3f s, accumulate %.3f s"
+                   " (total %.3f s)\n",
+            t_is/1e9, t_tk/1e9, G.t_acc/1e9, (t_is+t_tk+G.t_acc)/1e9);
+    for(int i=0;i<G.ndev;i++)
+        fprintf(stderr,"[q38tier]   dev%d: %llu issues %.3f s (%.1f us/call) |"
+                       " %llu takes %.3f s (%.1f us/call)\n",
+                G.dev[i],
+                (unsigned long long)G.n_issue[i], G.t_issue[i]/1e9,
+                G.n_issue[i]? G.t_issue[i]/1000.0/G.n_issue[i] : 0.0,
+                (unsigned long long)G.n_take[i], G.t_take[i]/1e9,
+                G.n_take[i]? G.t_take[i]/1000.0/G.n_take[i] : 0.0);
     pthread_mutex_unlock(&G.mx);
 }
 
