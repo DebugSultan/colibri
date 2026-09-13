@@ -146,7 +146,7 @@ int  q38t_plan_fill(int *layers, int *eids, int max);
 void q38t_cancel_plan(int layer, int eid);
 void q38t_fill_wait(void);
 
-/* Un blocco di telemetria su stderr: residenza, hit/miss, upload per device. */
+/* A telemetry block on stderr: residency, hit/miss, uploads per device. */
 void q38t_stats(void);
 
 #else /* !COLI_CUDA: stub inline, the engine stays CPU-only */

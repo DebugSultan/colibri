@@ -20,9 +20,9 @@
 #include "quant.h"            /* E4M3_LUT */
 
 #define Q38T_MAX_DEV  8
-/* Riserva di VRAM per il backend, misurata: vedi il commento in q38t_init. */
-#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3,5 GiB */
-#define Q38T_QCAP     16      /* staging ~4,7 MB/voce -> ~75 MB di tetto */
+/* VRAM reserve for the backend, measured: see the comment in q38t_init. */
+#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3.5 GiB */
+#define Q38T_QCAP     16      /* staging ~4.7 MB/item -> ~75 MB ceiling */
 #define Q38T_MAX_ROWS 8       /* backend_cuda.cu:2091, "decode-scale only" */
 
 typedef struct {
@@ -33,21 +33,21 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
-    size_t sc;                            /* float di scale per matrice */
-    size_t mat_bytes;                     /* byte e4m3 per matrice */
-    size_t exp_bytes;                     /* stima VRAM per esperto */
+    size_t sc;                            /* scale float per matrix */
+    size_t mat_bytes;                     /* e4m3 bytes per matrix */
+    size_t exp_bytes;                     /* VRAM estimate per expert */
     int dev[Q38T_MAX_DEV];
     size_t budget[Q38T_MAX_DEV], used[Q38T_MAX_DEV];
     Q38TSlot *slot;                       /* [nl*ne] */
     pthread_mutex_t mx;
     pthread_t th;
     int th_stop;
-    /* coda di upload con copie di staging */
+    /* upload queue with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[Q38T_QCAP];
     int qh, qt_, qn;
     pthread_cond_t cv;
     pthread_cond_t cv_take;               /* queue space + qt_take done */
-    /* statistiche */
+    /* statistics */
     uint64_t hits[Q38T_MAX_DEV], miss, uploads, upload_fail;
     uint64_t offers, promotions, swaps, q_full_skips, overflow_rows, take_fails;
     uint64_t tick;
@@ -88,7 +88,7 @@ static void *uploader(void *arg){
         int vl=G.q[G.qh].v_layer, ve=G.q[G.qh].v_eid;
         uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
         G.qh=(G.qh+1)%Q38T_QCAP; G.qn--;
-        pthread_cond_broadcast(&G.cv_take);          /* spazio in coda */
+        pthread_cond_broadcast(&G.cv_take);          /* queue space */
         if(ve>=0){
             /* swap: the victim is freed only when no group is in flight */
             while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
@@ -125,7 +125,7 @@ static void *uploader(void *arg){
         else  { int hd=home(eid);
                 G.upload_fail++;
                 if(G.used[hd]>=G.exp_bytes) G.used[hd]-=G.exp_bytes;
-                G.budget[hd]=G.used[hd];   /* scheda davvero piena: smettere */
+                G.budget[hd]=G.used[hd];   /* card really full: stop */
                 if(tg)coli_cuda_tensor_free(tg);
                 if(tu)coli_cuda_tensor_free(tu);
                 if(td)coli_cuda_tensor_free(td); }
@@ -274,9 +274,9 @@ void q38t_note(int layer,const int *eids,int K){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- offerta e promozione ------------------------------------------------ */
+/* --- offer and promotion -------------------------------------------------- */
 
-/* Chiamata con il lock preso. Torna 1 se accodato. */
+/* Called with the lock held. Returns 1 if queued. */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,
                           const uint8_t *gate,const uint8_t *up,
                           const uint8_t *down,const float *scales){
@@ -359,10 +359,10 @@ void q38t_offer(int layer,int eid,
         }
         if(cold>=0 && tier_should_promote(s->heat,ch)){
             Q38TSlot *v=&G.slot[cold];
-            v->resident=0;                       /* da ora e' CPU fallback */
+            v->resident=0;                       /* from now on it is CPU fallback */
             if(enqueue_locked(layer,eid,(int)(cold/G.ne),(int)(cold%G.ne),
                               gate,up,down,scales)) G.swaps++;
-            else v->resident=1;                  /* coda piena: si rimette */
+            else v->resident=1;                  /* queue full: put it back */
         }
     }
     pthread_mutex_unlock(&G.mx);
@@ -370,7 +370,7 @@ out:
     return;
 }
 
-/* --- esecuzione ---------------------------------------------------------- */
+/* --- execution ------------------------------------------------------------ */
 
 uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
     if(!G.on||!eids||!x||K<1||K>32||layer<0||layer>=G.nl) return 0;
@@ -454,7 +454,7 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- warmstart ----------------------------------------------------------- */
+/* --- warmstart ------------------------------------------------------------ */
 
 static const uint32_t *g_sort_heat;
 static int cmp_heat_desc(const void *a,const void *b){
@@ -512,7 +512,7 @@ void q38t_fill_wait(void){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- chiusura e telemetria ----------------------------------------------- */
+/* --- shutdown and telemetry ----------------------------------------------- */
 
 void q38t_stats(void){
     if(!G.on) return;
