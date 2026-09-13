@@ -1643,18 +1643,20 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "== Qwen3.8-Flash-Next native text engine | cache=%d/layer | CPU ==\n", cap);
 
-    /* Squadra OpenMP: SMT INCLUSA, due core fisici riservati. Al contrario
-     * degli altri motori, che si dimensionano sui core fisici. Il perche' e la
-     * misura che lo autorizza stanno in omp_tune.h, sopra questa funzione: qui
-     * il tempo e' denso-dominato e bandwidth-bound sulle pagine appena faultate
-     * (76% fra resident-mm e deltanet), non compute-bound su pesi residenti,
-     * quindi il fratello SMT copre latenza invece di contendere l'unita'
-     * vettoriale. Sul 3900X di riferimento: 20 thread su 24, -25,5%.
+    /* OpenMP thread policy: SMT INCLUDED, two physical cores reserved.
+     * Unlike the other engines, which size themselves on physical cores. The
+     * why and the measurement that authorizes it are in omp_tune.h, above
+     * this function: here the time is density-dominated and bandwidth-bound
+     * on freshly faulted pages (76% between resident-mm and deltanet), not
+     * compute-bound on resident weights, so the SMT sibling covers latency
+     * instead of contending for the vector unit. On the reference 3900X: 20
+     * threads out of 24, -25.5%.
      *
-     * Va qui e non nel launcher perche' `coli` esenta qwen38 dal suo default
-     * a core fisici (c/coli, blocco COLI_NO_OMP_TUNE) proprio per lasciare la
-     * politica a questo runtime -- stessa forma dell'esenzione di deepseek_v4.
-     * Serve percio' anche ai lanci diretti, che sono quelli dei benchmark. */
+     * It goes here and not in the launcher because `coli` exempts qwen38
+     * from its physical-core default (c/coli, COLI_NO_OMP_TUNE block)
+     * precisely to leave the policy to this runtime -- same shape as the
+     * deepseek_v4 exemption. It is therefore also needed for direct
+     * launches, which are the ones the benchmarks use. */
     coli_omp_tune_threads_smt("qwen38", 2);
 
     int is_ref=q38_reference_mode(refpath,serve_mode);
