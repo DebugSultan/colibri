@@ -1,4 +1,4 @@
-/* omp_tune.h — dimensionamento della squadra OpenMP sui CORE FISICI.
+/* omp_tune.h — sizing the OpenMP team on PHYSICAL CORES.
  *
  * WHY ONLY THE SIZING, AND NOT THE SPIN-WAIT.
  * The tuning block in colibri.c does two things with OPPOSITE risk profiles,
@@ -53,7 +53,7 @@
 #include <dirent.h>
 #endif
 
-/* Numero di core FISICI, o 0 se non determinabile. Mai un valore inventato. */
+/* Physical core count, or 0 if not determinable. Never an invented value. */
 #if defined(_WIN32)
 static int coli_count_windows_physical_cores(const void *buf, DWORD bytes)
 {
@@ -147,13 +147,13 @@ static void coli_omp_tune_threads(const char *engine)
 {
 #ifdef _OPENMP
     const char *off = getenv("COLI_NO_OMP_TUNE");
-    if (off) return;                       /* stesso kill-switch degli altri motori */
-    if (getenv("OMP_NUM_THREADS")) return; /* l'utente comanda */
+    if (off) return;                       /* same kill-switch as the other engines */
+    if (getenv("OMP_NUM_THREADS")) return; /* the user commands */
 
     int phys = coli_physical_cores();
-    if (phys <= 0) return;                 /* sconosciuto -> default di OpenMP */
+    if (phys <= 0) return;                 /* unknown -> OpenMP default */
     int logical = omp_get_max_threads();
-    if (phys >= logical) return;           /* niente SMT da evitare: silenzio */
+    if (phys >= logical) return;           /* no SMT to avoid: stay silent */
 
     omp_set_num_threads(phys);
     fprintf(stderr, "[OMP] %s: %d physical-core threads instead of %d logical CPUs; "
@@ -211,23 +211,23 @@ static void coli_omp_tune_threads_smt(const char *engine, int reserve_cores)
 {
 #ifdef _OPENMP
     if (getenv("COLI_NO_OMP_TUNE")) return; /* same kill-switch as the others */
-    if (getenv("OMP_NUM_THREADS")) return;  /* l'utente comanda */
+    if (getenv("OMP_NUM_THREADS")) return;  /* the user commands */
     if (reserve_cores < 0) return;
 
     int phys = coli_physical_cores();
-    if (phys <= 0) return;                  /* sconosciuto -> default di OpenMP */
+    if (phys <= 0) return;                  /* unknown -> OpenMP default */
     int logical = omp_get_max_threads();
     /* logical <= phys: no SMT to exploit (or a restricted affinity that has
      * already decided for us). In both cases touch nothing. */
     if (logical <= phys) return;
 
-    int per_core = logical / phys;          /* fratelli SMT per core fisico */
+    int per_core = logical / phys;          /* SMT siblings per physical core */
     int team = logical - reserve_cores * per_core;
-    if (team < phys) team = phys;           /* mai sotto il default odierno */
-    if (team >= logical) return;            /* riserva nulla: niente da dire */
+    if (team < phys) team = phys;           /* never below the current default */
+    if (team >= logical) return;            /* null reserve: nothing to say */
 
     omp_set_num_threads(team);
-    fprintf(stderr, "[OMP] %s: %d threads (SMT inclusa) su %d CPU logiche, "
+    fprintf(stderr, "[OMP] %s: %d threads (SMT included) on %d logical CPUs, "
                     "%d physical cores reserved; the FP8 expert matmuls are "
                     "bandwidth-bound and SMT pays (measured: -25.5%%); "
                     "set OMP_NUM_THREADS=<n> to override\n",
