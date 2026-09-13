@@ -20,6 +20,8 @@
 #include "quant.h"            /* E4M3_LUT */
 
 #define Q38T_MAX_DEV  8
+/* Riserva di VRAM per il backend, misurata: vedi il commento in q38t_init. */
+#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3,5 GiB */
 #define Q38T_QCAP     16      /* staging ~4,7 MB/voce -> ~75 MB di tetto */
 #define Q38T_MAX_ROWS 8       /* backend_cuda.cu:2091, "decode-scale only" */
 
@@ -184,12 +186,22 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     }
 
     G.exp_bytes = 3*G.mat_bytes + 3*G.sc*sizeof(float) + 4096; /* + slack */
+    /* Quanta VRAM lasciare al backend. Un GiB era una stima a occhio, ed e'
+     * misurata sbagliata: il backend alloca i tensori di lavoro e i workspace
+     * cuBLASLt DOPO che il tier ha gia' preso i suoi pesi, quindi il "free"
+     * letto qui e' il valore piu' ottimistico dell'intero run. Prova da 128
+     * token con riserva da 1 GiB: budget dichiarato 14,2/14,3 GB, due
+     * "[CUDA] tensor allocation: out of memory", e il clamp adattivo
+     * dell'uploader si e' assestato a 11,9/12,0 GB -- al backend servivano
+     * ~3,3 GB, non 1. Si riserva Q38T_DEV_RESERVE e il clamp resta come rete:
+     * se la scheda si riempie lo stesso il tier smette di promuovere invece di
+     * far fallire il run. */
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
         size_t b = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+                   : (freeb>Q38T_DEV_RESERVE ? freeb-Q38T_DEV_RESERVE : 0);
         G.budget[i]=b;
         fprintf(stderr,"[q38tier] dev %d: %.1f GB free, budget %.1f GB (~%zu experts)\n",
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
@@ -297,6 +309,26 @@ void q38t_offer(int layer,int eid,
          * basta. Se il piano nel frattempo e' stato annullato (planned=0), si
          * ricade sulla strada normale qui sotto. */
         if(s->planned){
+            /* Qui si ASPETTA posto in coda, al contrario del percorso caldo
+             * qui sotto. Scartare un'offerta pianificata butta la lettura da
+             * disco che il motore ha appena fatto per costruirla, e siccome lo
+             * scarto restituisce il budget il giro dopo q38t_plan_fill la
+             * ripianifica identica: nel warmstart misurato 4535 esperti su
+             * 9792 letti, copiati e buttati (46 %). Il warmstart e' per
+             * definizione una fase "riempi e aspetta" -- q38t_fill_wait()
+             * esiste per quello -- quindi bloccare non toglie nulla a nessuno.
+             * Nel percorso caldo invece rinunciare resta giusto: li' c'e' un
+             * token che aspetta. */
+            while(G.qn>=Q38T_QCAP && !G.th_stop)
+                pthread_cond_wait(&G.cv_take,&G.mx);
+            /* L'attesa ha rilasciato il lock: lo slot puo' essere cambiato. */
+            if(s->resident||s->queued||!s->planned){
+                if(s->planned){
+                    if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+                    s->planned=0;
+                }
+                pthread_mutex_unlock(&G.mx); goto out;
+            }
             if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
             else { if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes; s->planned=0; }
             pthread_mutex_unlock(&G.mx); goto out;
