@@ -1,14 +1,14 @@
 /* qwen38_tier.c -- CUDA VRAM expert tier for the qwen38 engine. See header.
  *
- * Parente stretto di qwen36_tier.c, ma con il vincolo invertito che l'header
- * spiega: qui il tier non puo' leggere il disco e non conserva mai puntatori
- * alla RAM, quindi promuove solo cio' che il motore gli OFFRE. Da questo
- * discende la differenza di struttura piu' visibile rispetto all'altro file:
- * non c'e' nessun tick LFRU periodico che va a caccia di candidati (li'
- * poteva, perche' i byte erano sempre raggiungibili). La decisione di
- * promozione si prende dentro q38t_offer, cioe' nell'unico istante in cui i
- * byte esistono davvero -- ed e' anche l'istante giusto, perche' un'offerta
- * nasce da un miss appena servito: l'esperto ha appena dimostrato di servire. */
+ * Close relative of qwen36_tier.c, but with the inverted constraint the
+ * header explains: here the tier cannot read the disk and never keeps
+ * pointers to RAM, so it promotes only what the engine OFFERS it. From this
+ * follows the most visible structural difference from the other file: there
+ * is no periodic LFRU tick hunting for candidates (it could there, because
+ * the bytes were always reachable). The promotion decision is taken inside
+ * q38t_offer, i.e. at the only instant the bytes really exist -- and it is
+ * also the right instant, because an offer is born from a miss just served:
+ * the expert has just proven itself useful. */
 #ifdef COLI_CUDA
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,9 +20,9 @@
 #include "quant.h"            /* E4M3_LUT */
 
 #define Q38T_MAX_DEV  8
-/* Riserva di VRAM per il backend, misurata: vedi il commento in q38t_init. */
-#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3,5 GiB */
-#define Q38T_QCAP     16      /* staging ~4,7 MB/voce -> ~75 MB di tetto */
+/* VRAM reserve for the backend, measured: see the comment in q38t_init. */
+#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3.5 GiB */
+#define Q38T_QCAP     16      /* staging ~4.7 MB/item -> ~75 MB ceiling */
 #define Q38T_MAX_ROWS 8       /* backend_cuda.cu:2091, "decode-scale only" */
 
 typedef struct {
@@ -33,29 +33,29 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
-    size_t sc;                            /* float di scale per matrice */
-    size_t mat_bytes;                     /* byte e4m3 per matrice */
-    size_t exp_bytes;                     /* stima VRAM per esperto */
+    size_t sc;                            /* scale float per matrix */
+    size_t mat_bytes;                     /* e4m3 bytes per matrix */
+    size_t exp_bytes;                     /* VRAM estimate per expert */
     int dev[Q38T_MAX_DEV];
     size_t budget[Q38T_MAX_DEV], used[Q38T_MAX_DEV];
     Q38TSlot *slot;                       /* [nl*ne] */
     pthread_mutex_t mx;
     pthread_t th;
     int th_stop;
-    /* coda di upload con copie di staging */
+    /* upload queue with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[Q38T_QCAP];
     int qh, qt_, qn;
     pthread_cond_t cv;
-    pthread_cond_t cv_take;               /* spazio in coda + qt_take fatto */
-    /* statistiche */
+    pthread_cond_t cv_take;               /* queue space + qt_take done */
+    /* statistics */
     uint64_t hits[Q38T_MAX_DEV], miss, uploads, upload_fail;
     uint64_t offers, promotions, swaps, q_full_skips, overflow_rows, take_fails;
     uint64_t tick;
-    /* stato di issue del (singolo) thread di decode */
+    /* issue state of the (single) decode thread */
     int is_cnt[Q38T_MAX_DEV];
     int is_k[Q38T_MAX_DEV][Q38T_MAX_ROWS];
     float *is_x; size_t is_x_floats;
-    int issue_open;                       /* nessun free mentre un gruppo vola */
+    int issue_open;                       /* no free while a group is in flight */
     /* warmstart */
     int *fill_order; int fill_n, fill_cur;
     uint32_t *heat0;
@@ -64,11 +64,11 @@ static struct {
 static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
 
-/* Staging. In qwen36 questa funzione doveva riportare i nibble int4 da
- * complemento a due a binario sfalsato; qui il formato in RAM E' gia' quello
- * del backend (e4m3 grezzo, scale per blocco 128x128), quindi sono tre copie e
- * nient'altro. Le tre matrici NON si assumono contigue: con COLI_MAP_EXPERTS=1
- * lo slot punta a tre mappature distinte del file. */
+/* Staging. In qwen36 this function had to bring the two's-complement int4
+ * nibbles back to biased binary; here the format in RAM IS already the
+ * backend's (raw e4m3, a scale per 128x128 block), so it is three copies and
+ * nothing else. The three matrices are NOT assumed contiguous: with
+ * COLI_MAP_EXPERTS=1 the slot points at three distinct file mappings. */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *gate, const uint8_t *up, const uint8_t *down,
                   const float *scales){
@@ -88,17 +88,18 @@ static void *uploader(void *arg){
         int vl=G.q[G.qh].v_layer, ve=G.q[G.qh].v_eid;
         uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
         G.qh=(G.qh+1)%Q38T_QCAP; G.qn--;
-        pthread_cond_broadcast(&G.cv_take);          /* spazio in coda */
+        pthread_cond_broadcast(&G.cv_take);          /* queue space */
         if(ve>=0){
-            /* swap: la vittima si libera solo quando nessun gruppo e' in volo */
+            /* swap: the victim is freed only when no group is in flight */
             while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
             Q38TSlot *v=qs(vl,ve);
             if(G.th_stop && G.issue_open){
-                /* Chiusura con un gruppo ancora aperto: q38t_take, l'unica cosa
-                 * che azzera issue_open, non arrivera' mai. Si abbandona lo
-                 * swap invece di liberare un tensore che il gruppo in volo puo'
-                 * ancora leggere; il flag resident era gia' stato spento da chi
-                 * ha accodato, quindi va rimesso com'era. */
+                 /* Shutdown with a group still open: q38t_take, the only thing
+                  * that clears issue_open, will never come. The swap is
+                  * abandoned instead of freeing a tensor the group in flight
+                  * can still read; the resident flag had already been turned
+                  * off by the one who queued, so it is put back the way it
+                  * was. */
                 v->resident=1; qs(layer,eid)->queued=0;
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
@@ -111,8 +112,8 @@ static void *uploader(void *arg){
         } else pthread_mutex_unlock(&G.mx);
 
         int dv=G.dev[home(eid)];
-        /* fmt=8: gate/up sono [inter,hidden], down e' [hidden,inter]; la firma
-         * vuole (I=ingresso, O=uscita), non (righe, colonne). */
+        /* fmt=8: gate/up are [inter,hidden], down is [hidden,inter]; the
+         * signature wants (I=input, O=output), not (rows, columns). */
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok = coli_cuda_tensor_upload(&tg, w,                 sc,          8, G.D,  G.Ih, dv)
               && coli_cuda_tensor_upload(&tu, w+G.mat_bytes,     sc+G.sc,     8, G.D,  G.Ih, dv)
@@ -124,7 +125,7 @@ static void *uploader(void *arg){
         else  { int hd=home(eid);
                 G.upload_fail++;
                 if(G.used[hd]>=G.exp_bytes) G.used[hd]-=G.exp_bytes;
-                G.budget[hd]=G.used[hd];   /* scheda davvero piena: smettere */
+                G.budget[hd]=G.used[hd];   /* card really full: stop */
                 if(tg)coli_cuda_tensor_free(tg);
                 if(tu)coli_cuda_tensor_free(tu);
                 if(td)coli_cuda_tensor_free(td); }
@@ -140,10 +141,10 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
     if(G.on){
-        /* Singleton di processo: gli slot sono dimensionati su UNA geometria.
-         * Un secondo modello (adapter Segment) non puo' condividerli, quindi
-         * si sente dire di no e resta su CPU. Per questo il motore ricorda il
-         * ritorno di questa funzione invece di fidarsi di q38t_ready(). */
+        /* Process singleton: the slots are sized for ONE geometry. A second
+         * model (Segment adapter) cannot share them, so it is told no and
+         * stays on CPU. That is why the engine remembers the return of this
+         * function instead of trusting q38t_ready(). */
         fprintf(stderr,"[q38tier] already attached to another model in this "
                        "process -> CPU path for this one\n");
         return 0;
@@ -178,24 +179,24 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     if(have<G.ndev) G.ndev=have;
     if(G.ndev<1){ fprintf(stderr,"[q38tier] no CUDA devices -> CPU path\n"); return 0; }
 
-    /* La LUT e4m3 va pubblicata PRIMA di qualunque upload fmt=8: senza, il
-     * backend li rifiuta invece di decodificare contro una tabella di zeri. */
+    /* The e4m3 LUT must be published BEFORE any fmt=8 upload: without it,
+     * the backend refuses them instead of decoding against a table of zeros. */
     if(!coli_cuda_fp8_set_lut(E4M3_LUT)){
         fprintf(stderr,"[q38tier] coli_cuda_fp8_set_lut failed -> CPU path\n");
         return 0;
     }
 
     G.exp_bytes = 3*G.mat_bytes + 3*G.sc*sizeof(float) + 4096; /* + slack */
-    /* Quanta VRAM lasciare al backend. Un GiB era una stima a occhio, ed e'
-     * misurata sbagliata: il backend alloca i tensori di lavoro e i workspace
-     * cuBLASLt DOPO che il tier ha gia' preso i suoi pesi, quindi il "free"
-     * letto qui e' il valore piu' ottimistico dell'intero run. Prova da 128
-     * token con riserva da 1 GiB: budget dichiarato 14,2/14,3 GB, due
-     * "[CUDA] tensor allocation: out of memory", e il clamp adattivo
-     * dell'uploader si e' assestato a 11,9/12,0 GB -- al backend servivano
-     * ~3,3 GB, non 1. Si riserva Q38T_DEV_RESERVE e il clamp resta come rete:
-     * se la scheda si riempie lo stesso il tier smette di promuovere invece di
-     * far fallire il run. */
+    /* How much VRAM to leave to the backend. One GiB was an eyeball estimate,
+     * and it is measured wrong: the backend allocates its work tensors and
+     * cuBLASLt workspaces AFTER the tier has already taken its weights, so
+     * the "free" read here is the most optimistic value of the whole run.
+     * 128-token probe with a 1 GiB reserve: declared budget 14.2/14.3 GB,
+     * two "[CUDA] tensor allocation: out of memory", and the uploader's
+     * adaptive clamp settled at 11.9/12.0 GB -- the backend needed ~3.3 GB,
+     * not 1. Q38T_DEV_RESERVE is reserved and the clamp stays as a net: if
+     * the card fills up anyway the tier stops promoting instead of failing
+     * the run. */
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
@@ -249,16 +250,16 @@ int q38t_is_resident(int layer,int eid){
     return r;
 }
 
-/* --- calore -------------------------------------------------------------- */
+/* --- heat ---------------------------------------------------------------- */
 
 void q38t_note(int layer,const int *eids,int K){
     if(!G.on||!eids||layer<0||layer>=G.nl) return;
     pthread_mutex_lock(&G.mx);
     if(layer==0){
         G.tick++;
-        /* Decadimento periodico: un carico vecchio non deve possedere la VRAM
-         * per sempre. Le promozioni, a differenza di qwen36_tier, non si
-         * decidono qui -- servono i byte, e qui non ci sono. */
+        /* Periodic decay: an old load must not own the VRAM forever. The
+         * promotions, unlike qwen36_tier, are not decided here -- the bytes
+         * are needed, and there are none here. */
         if(!(G.tick%1024)){
             size_t n=(size_t)G.nl*G.ne;
             for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
@@ -273,9 +274,9 @@ void q38t_note(int layer,const int *eids,int K){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- offerta e promozione ------------------------------------------------ */
+/* --- offer and promotion -------------------------------------------------- */
 
-/* Chiamata con il lock preso. Torna 1 se accodato. */
+/* Called with the lock held. Returns 1 if queued. */
 static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,
                           const uint8_t *gate,const uint8_t *up,
                           const uint8_t *down,const float *scales){
@@ -305,23 +306,23 @@ void q38t_offer(int layer,int eid,
 
     int di=home(eid);
     if(planned){
-        /* Il budget e' gia' stato riservato da q38t_plan_fill: si accoda e
-         * basta. Se il piano nel frattempo e' stato annullato (planned=0), si
-         * ricade sulla strada normale qui sotto. */
+        /* The budget was already reserved by q38t_plan_fill: queue and done.
+         * If the plan has meanwhile been cancelled (planned=0), it falls
+         * back to the normal path below. */
         if(s->planned){
-            /* Qui si ASPETTA posto in coda, al contrario del percorso caldo
-             * qui sotto. Scartare un'offerta pianificata butta la lettura da
-             * disco che il motore ha appena fatto per costruirla, e siccome lo
-             * scarto restituisce il budget il giro dopo q38t_plan_fill la
-             * ripianifica identica: nel warmstart misurato 4535 esperti su
-             * 9792 letti, copiati e buttati (46 %). Il warmstart e' per
-             * definizione una fase "riempi e aspetta" -- q38t_fill_wait()
-             * esiste per quello -- quindi bloccare non toglie nulla a nessuno.
-             * Nel percorso caldo invece rinunciare resta giusto: li' c'e' un
-             * token che aspetta. */
+             /* Here it WAITS for queue space, in contrast with the hot path
+              * below. Discarding a planned offer throws away the disk read
+              * the engine just did to build it, and since discarding returns
+              * the budget, the next q38t_plan_fill round re-plans it
+              * identically: in the measured warmstart, 4535 experts out of
+              * 9792 were read, copied and thrown away (46%). The warmstart
+              * is by definition a "fill and wait" phase -- q38t_fill_wait()
+              * exists for that -- so blocking takes nothing from anyone. In
+              * the hot path instead, giving up stays right: there is a token
+              * waiting there. */
             while(G.qn>=Q38T_QCAP && !G.th_stop)
                 pthread_cond_wait(&G.cv_take,&G.mx);
-            /* L'attesa ha rilasciato il lock: lo slot puo' essere cambiato. */
+             /* The wait released the lock: the slot may have changed. */
             if(s->resident||s->queued||!s->planned){
                 if(s->planned){
                     if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
@@ -342,11 +343,11 @@ void q38t_offer(int layer,int eid,
         pthread_mutex_unlock(&G.mx); goto out;
     }
 
-    /* Scheda piena: si entra solo scalzando il piu' freddo residente di questa
-     * stessa scheda, e solo se il contratto condiviso (tier.h, con isteresi) lo
-     * autorizza. La scansione e' lineare su nl*ne slot: a un miss per esperto e
-     * un token da oltre un secondo e' rumore, e tenere una struttura ordinata
-     * costerebbe piu' complessita' di quanta ne faccia risparmiare. */
+    /* Card full: entry is only by bumping the coldest resident of this same
+     * card, and only if the shared contract (tier.h, with hysteresis)
+     * authorizes it. The scan is linear over nl*ne slots: at one miss per
+     * expert and a token of over a second it is noise, and keeping an ordered
+     * structure would cost more complexity than it would save. */
     {
         size_t n=(size_t)G.nl*G.ne;
         long cold=-1; uint32_t ch=0;
@@ -358,10 +359,10 @@ void q38t_offer(int layer,int eid,
         }
         if(cold>=0 && tier_should_promote(s->heat,ch)){
             Q38TSlot *v=&G.slot[cold];
-            v->resident=0;                       /* da ora e' CPU fallback */
+            v->resident=0;                       /* from now on it is CPU fallback */
             if(enqueue_locked(layer,eid,(int)(cold/G.ne),(int)(cold%G.ne),
                               gate,up,down,scales)) G.swaps++;
-            else v->resident=1;                  /* coda piena: si rimette */
+            else v->resident=1;                  /* queue full: put it back */
         }
     }
     pthread_mutex_unlock(&G.mx);
@@ -369,7 +370,7 @@ out:
     return;
 }
 
-/* --- esecuzione ---------------------------------------------------------- */
+/* --- execution ------------------------------------------------------------ */
 
 uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
     if(!G.on||!eids||!x||K<1||K>32||layer<0||layer>=G.nl) return 0;
@@ -388,12 +389,12 @@ uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
         Q38TSlot *s=qs(layer,e);
         if(!s->resident){ G.miss++; continue; }
         int di=home(e), c=G.is_cnt[di];
-        /* Il backend tiene un solo issue in volo per device e ne rifiuta piu'
-         * di Q38T_MAX_ROWS righe, quindi una scheda che si vede arrivare piu'
-         * esperti del tetto non puo' spezzare il lancio: i sopranumerari
-         * restano alla CPU via maschera. Con topk=10 e due schede la
-         * spartizione eid%2 ne manda ~5 per parte e il caso non si presenta,
-         * ma niente lo vieta e il conteggio lo dice (overflow_rows). */
+        /* The backend keeps a single issue in flight per device and refuses
+         * more than Q38T_MAX_ROWS rows, so a card that sees more experts
+         * arrive than the ceiling cannot split the issue: the extras stay on
+         * the CPU via the mask. With topk=10 and two cards the eid%2 split
+         * sends ~5 each way and the case does not present itself, but nothing
+         * forbids it and the count tells (overflow_rows). */
         if(c>=Q38T_MAX_ROWS){ G.miss++; G.overflow_rows++; continue; }
         tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
         G.is_k[di][c]=k; G.is_cnt[di]=c+1;
@@ -428,10 +429,10 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
         if(!c) continue;
         const float *y=coli_cuda_expert_group_take(G.dev[di]);
         if(!y){
-            /* Questi k erano nella maschera: la CPU li ha saltati e adesso
-             * nessuno li calcola, cioe' il token esce con un pezzo di MoE in
-             * meno. Non e' recuperabile qui (i pesi in RAM sono gia' stati
-             * sfrattati), ma non deve passare in silenzio. */
+            /* These k were in the mask: the CPU skipped them and now nobody
+             * computes them, i.e. the token comes out with a piece of the MoE
+             * missing. It is not recoverable here (the weights in RAM have
+             * already been evicted), but it must not pass silently. */
             G.take_fails++;
             if(G.take_fails==1)
                 fprintf(stderr,"[q38tier] WARNING: expert_group_take failed on dev %d; "
@@ -453,7 +454,7 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- warmstart ----------------------------------------------------------- */
+/* --- warmstart ------------------------------------------------------------ */
 
 static const uint32_t *g_sort_heat;
 static int cmp_heat_desc(const void *a,const void *b){
@@ -467,8 +468,8 @@ int q38t_plan_fill(int *layers,int *eids,int max){
     size_t n=(size_t)G.nl*G.ne;
     pthread_mutex_lock(&G.mx);
     if(!G.fill_order){
-        /* Senza HEAT_FILE non c'e' un ordine sensato da inventare: si lascia
-         * che sia il traffico a promuovere, che e' gia' la strada normale. */
+        /* Without HEAT_FILE there is no sensible order to invent: let the
+         * traffic promote, which is already the normal way. */
         if(!G.heat0){ pthread_mutex_unlock(&G.mx); return 0; }
         G.fill_order=malloc(n*sizeof(int));
         if(!G.fill_order){ pthread_mutex_unlock(&G.mx); return 0; }
@@ -511,7 +512,7 @@ void q38t_fill_wait(void){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* --- chiusura e telemetria ----------------------------------------------- */
+/* --- shutdown and telemetry ----------------------------------------------- */
 
 void q38t_stats(void){
     if(!G.on) return;
@@ -541,10 +542,10 @@ void q38t_stats(void){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* Il calore imparato in questa sessione, per la prossima. Stesso formato
- * dell'altro tier (magia, layer, esperti, poi la matrice), cosi' un file scritto
- * qui e' leggibile da qui e basta: le geometrie non coincidono fra i due motori
- * e l'header le controlla prima di fidarsi. */
+/* The heat learned in this session, for the next one. Same format as the
+ * other tier (magic, layer, experts, then the matrix), so a file written here
+ * is readable from here and that is enough: the geometries do not coincide
+ * between the two engines and the header checks them before trusting. */
 static void heat_save(void){
     const char *hf=getenv("HEAT_FILE");
     if(!hf) return;
@@ -572,7 +573,7 @@ void q38t_shutdown(void){
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
-    /* Quel che resta in coda non e' mai stato caricato: si libera lo staging. */
+    /* What remains in the queue was never loaded: free the staging. */
     while(G.qn>0){ free(G.q[G.qh].w); free(G.q[G.qh].s);
                    G.qh=(G.qh+1)%Q38T_QCAP; G.qn--; }
     size_t n=(size_t)G.nl*G.ne;
