@@ -106,6 +106,11 @@ class FamilyDescriptor:
     # guardia del convertitore, che quelle indicazioni le ha gia' per famiglia e
     # sotto test: due copie della stessa mappa sarebbero il difetto che questa
     # correzione sta chiudendo.
+    #
+    # Qwen3.8 was in that second group while it only ran on the official FP8
+    # checkpoint. It now has tools/convert_qwen38_int4.py, which takes --repo,
+    # --outdir and --group-size just like convert_glm53.py, so coli can drive
+    # it: the criterion is the command line, not the age of the family.
     converter: str = ""
     converter_accepts: tuple = ()
     converter_mtp_pass: bool = False
@@ -1239,6 +1244,15 @@ FAMILIES = (
         id="qwen38",
         model_types=("qwen4_exp", "qwen4_exp_text"),
         display_name="Qwen3.8-Flash-Next",
+        # No ebits/io_bits/xbits: the int4 container holds ONLY the experts,
+        # the dense tensors stay those of the FP8 checkpoint mounted alongside.
+        # The three options would have nothing to act on, and accepting them
+        # only to ignore them is the silent version of the same fault.
+        converter="convert_qwen38_int4.py",
+        converter_accepts=("group_size",),
+        # The MTP head is a plan unit like the other 48 MoE layers, not a
+        # second pass: the converter writes it in the same run.
+        converter_mtp_pass=False,
         display_scale="176B",
         engine_artifact="qwen38",
         engine_aliases=(),

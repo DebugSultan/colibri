@@ -48,12 +48,8 @@ GLM52_MODEL_TYPES = {"glm_moe_dsa", "glm5_moe", "glm"}
 OTHER_FAMILY_PATHS = {
     "glm5_next":       "GLM-5.3-Flash: use tools/convert_glm53.py",
     "glm5_next_text":  "GLM-5.3-Flash: use tools/convert_glm53.py",
-    "qwen4_exp":       "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
-    "qwen4_exp_text":  "Qwen3.8-Flash-Next is NOT converted: download the official "
-                       "FP8 checkpoint (Qwen/Qwen3.8-Flash-Next-FP8) and run it "
-                       "directly; see docs/qwen38.md and issue #1304",
+    "qwen4_exp":       "Qwen3.8-Flash-Next: use tools/convert_qwen38_int4.py",
+    "qwen4_exp_text":  "Qwen3.8-Flash-Next: use tools/convert_qwen38_int4.py",
     "qwen3_5_moe":     "Qwen3.6: use tools/convert_qwen36.py",
     "qwen3_5_moe_text":"Qwen3.6: use tools/convert_qwen36.py",
     "inkling_mm_model":"Inkling: use tools/convert_inkling_int4.py",
@@ -87,7 +83,7 @@ def check_model_family(config, where):
                          f"tensors and roughly double the size (#1304).\n  {hint}")
     raise SystemExit(f"ERROR: {where} is '{model_type}', which this converter does "
                      f"not know. It converts GLM-5.2 only; other families have "
-                     f"their own tools under c/tools/, and Qwen3.8 needs none.")
+                     f"their own tools under c/tools/.")
 
 
 

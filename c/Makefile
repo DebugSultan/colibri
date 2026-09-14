@@ -983,6 +983,13 @@ tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c dsv4_mhc.h
 
 tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c dsv4_quant.h
 	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
+
+# Cross-language container gate: the bytes tools/convert_qwen38_int4.py writes
+# must be the bytes quant.h's matmul_i4_grouped() decodes. Reads the committed
+# fixture tests/fixtures/qwen38_int4_gs64.bin, which the converter regenerates
+# with --emit-fixture.
+tests/test_qwen38_int4_container$(EXE): tests/test_qwen38_int4_container.c quant.h
+	$(CC) $(CFLAGS) tests/test_qwen38_int4_container.c -o tests/test_qwen38_int4_container$(EXE) $(LDFLAGS)
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
