@@ -34,6 +34,8 @@ c/COLI_V4_UNIT_*.o
 c/build/
 c/iobench
 c/iobench.exe
+c/matmul_bench
+c/matmul_bench.exe
 c/tok_test
 c/backend_cuda.o
 c/backend_cuda_test

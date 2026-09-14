@@ -1146,6 +1146,9 @@ portable:
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
+matmul_bench$(EXE): matmul_bench.c
+	$(CC) $(CFLAGS) matmul_bench.c -o matmul_bench$(EXE) $(LDFLAGS) -lm
+
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1899,13 +1902,16 @@ uninstall:
 clean:
 	$(PYTHON) tools/clean.py
 
+bench-matmul: matmul_bench$(EXE)
+	@if [ -n "$(ARGS)" ]; then ./matmul_bench$(EXE) $(ARGS); else echo "built matmul_bench$(EXE) - run: OMP_NUM_THREADS=20 ./matmul_bench$(EXE) [seconds-per-measurement]"; fi
+
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	qwen38-tiny-generate qwen38-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
-	test-c test-python test check clean install uninstall bench
+	test-c test-python test check clean install uninstall bench bench-matmul
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
