@@ -116,14 +116,16 @@ multimodale.
 
 ## 2. La macchina
 
-node-01: Ryzen 9 3900X (12c/24t), **64 GB DDR4 a 3200** (da NON rialzare —
-sospetta causa del panic), NVMe **Samsung 990 PRO 1 TB** singolo, zram 30,2 G.
+node-01: Ryzen 9 3900X (12c/24t, Zen 2: **AVX2 nativo 256 bit, niente AVX512**),
+**64 GB DDR4 a 3200** (da NON rialzare — sospetta causa del panic), NVMe
+**Samsung 990 PRO 1 TB** singolo, zram 30,2 G.
 GPU: RTX 5070 Ti 16 GB + RTX 5060 Ti 16 GB, Blackwell **sm_120** (CUDA ≥ 12.8;
 in casa è pinnata la 13.0).
 
-Vincolo permanente: sulla stessa VRAM gira il **cervello 27B K12 di
-produzione**, con picco 30.962 MiB su 32 GiB. La Fase 0 non lo tocca. La
-Fase 1 richiede una finestra concordata.
+Vincolo di **sviluppo** (sparisce al cutover, §6.5): finché colibri non
+sostituisce llama.cpp, sulla stessa VRAM gira il cervello 27B K12 di
+produzione, con picco 30.962 MiB su 32 GiB. La Fase 0 non lo tocca; le fasi
+che toccano GPU richiedono finestra concordata SOLO nel regime di sviluppo.
 
 ---
 
@@ -237,16 +239,18 @@ Con `gs = 128` lungo l'input, per esperto:
 | | FP8 (oggi) | int4 g4 gs64 |
 |---|---|---|
 | per esperto | 4,6881 MiB | **2,6367 MiB** |
-| esperti su disco (24.576, MTP escluso) | 123,3 GB | **~67,9 GB** |
+| esperti su disco (25.088, MTP incluso) | 123,3 GB | **~69,4 GB** |
 | streaming per token | 2,198 GiB | **1,236 GiB** |
-| residenti in 45 GiB di RAM | 9.829 = 40 % | 17.454 = **71 %** |
-| residenti in 50-55 GiB (K12 spento) | 10.919-12.012 = 44-49 % | 19.394-21.358 = **79-87 %** |
-| residenti in 32 GiB di VRAM | 6.989 = 28 % | 12.424 = **51 %** |
+| residenti in 45 GiB di RAM | 9.829 = 39 % | 17.454 = **70 %** |
+| residenti in 50-55 GiB (K12 spento) | 10.919-12.012 = 43-48 % | 19.394-21.358 = **77-85 %** |
+| residenti in 32 GiB di VRAM | 6.989 = 28 % | 12.424 = **50 %** |
 
-Le percentuali sono su **24.576 esperti** (i 48 layer del percorso base; il
-layer MTP resta FP8 e fuori container). I numeri int4 precedenti di questa
-tabella (2,4902 MiB, 65,5 GB) erano stime gs128: corretti al formato gs64
-verificato col convertitore (2.457.600 B packed + 307.200 B scale).
+Le percentuali sono su **25.088 esperti** (48 layer + MTP; il titolare ha
+deciso il 14/09: **anche MTP va a int4** — un container uniforme, quando il
+percorso speculativo si attiva i suoi esperti sono già lì). I numeri int4
+precedenti di questa tabella (2,4902 MiB, 65,5 GB) erano stime gs128:
+corretti al formato gs64 verificato col convertitore (2.457.600 B packed +
+307.200 B scale).
 
 La sorpresa, ora misurata: **int4 g4 con `gs=128` ha molte più scale della
 sorgente FP8**, non meno. La sorgente ha scale per blocco 128×128, e l'header
@@ -375,31 +379,40 @@ f32 per 64):**
 
 | livello | contenuto | GiB |
 |---|---|---|
-| VRAM | ~8-9k esperti caldi NVFP4 + MTP (~2) + head (1,2) + KV q8_0 (~1,6) | ~27-30 |
+| VRAM | ~8-9k esperti caldi **int4** + MTP (~2) + head (1,2) + KV q8_0 (~1,6) | ~27-30 |
 | RAM | ~15,5k esperti int4 (40) + dense (5,4) + workspace (2-3) | ~47-49 |
 | SSD | PLE (47,75) + ViT + fallback FP8 | — |
 
 Totale esperti residenti: **24.576/24.576**. Lo storm sparisce; il prefill
-diventa compute-bound ⇒ è LÌ che «NVFP4 nettamente più veloce di int4» diventa
-vero: per GEMV (decode) i formati valgono lo stesso (memory-bound, byte
-uguali) — la velocità decode viene dalla residenza, non dal formato. A
-prefill batched, tensor core FP4 su sm_120 ≫ int4 su CUDA core.
+batched diventa compute-bound ⇒ lì il GEMM accelera, con la strada standard
+su sm_120: dequant-in-kernel + INT8 MMA (i tensor core INT4 non esistono più
+da sm_89; il `grouped_s4_wmma` wmma-s4 del codice è path pre-Ada). Per il
+decode GEMV i formati valgono lo stesso (memory-bound, byte uguali): la
+velocità decode viene dalla residenza, non dal formato.
 
-**NVFP4: il verdetto 27B NON si eredita, il metodo sì.** La bocciatura (3×)
-valeva per il denso 27B vs BF16 (memoria NVFP4, § «l'angolo che resta vivo»:
-su un MoE si rimisura da zero). Le tre misure che viaggiano con noi:
-(1) **KL mediana + top-1, mai PPL** (3/3 avrebbe promosso i peggiori);
-(2) **imatrix su NVFP4 peggiora** (+38 % mediana) → testare con e senza;
-(3) **q8_0 sulla cache KV è gratis** (0,99× = rumore) e f16-K vantaggio
-inesistente ⇒ la leva q8_0 per la KV è valida (limite dichiarato: KL misurata
-a ctx 512-8192, l'effetto a contesto lungo va provato sul compito). A favore
-del MoE: NVIDIA rilascia `nvidia/Qwen3.8-Flash-Next-NVFP4` esperti-only (la
-scelta del vendor), la ridondanza fra 512 esperti/layer, scala per-16 più
-fine della nostra gs64. A sfavore: sul 27B il danno era TUTTO nelle FFN —
-cioè esattamente ciò che gli esperti sono qui; la ridondanza MoE è ipotesi
-finché non è KL. **Gate: d3 (KL+top-1) su nvidia NVFP4 vs il nostro int4-gs64
-vs FP8, stesso harness, una tornata.** Rosso ⇒ il tier parte int4 (kernel già
-pronti, stage() memcpy) e NVFP4 resta alla porta.
+**NVFP4 declassato a ipotesi condizionata (revisione del pomeriggio 14/09,
+spinta dal titolare: «prima di fare casini con la quant»).** Analisi per
+ruolo: (a) decode GEMV memory-bound a byte identici ⇒ vantaggio ZERO — e il
+decode è l'orizzonte della campagna; (b) capacità VRAM: byte identici ⇒ zero;
+(c) qualità vs int4-gs64: non provata (sul 27B il danno NVFP4 era TUTTO nelle
+FFN — cioè ciò che gli esperti sono qui); (d) GEMM prefill: l'unico vantaggio
+vero, ma smussato — il percorso int4 standard (dequant + INT8 MMA) già copre
+sm_120 e il NVFP4 vale ~2× SOLO su quel punto, che diventa collo solo dopo la
+residenza totale. E il doppio formato espone il rischio che il titolare ha
+nominato: gli esperti caldi (tool-call, Python, italiano) in int4 in RAM
+mentre il NVFP4 sta sul freddo = tutti i costi, nessun beneficio. Soprattutto:
+**lo skew risolve il piazzamento, non il formato** — se l'hotness deriva, la
+promozione dinamica RAM→VRAM deve costare una memcpy, ed è vero solo a formato
+uniforme. **Deciso: quant UNICA int4-gs64 ovunque** — un convertitore, un
+container, una validazione d3, stage() memcpy. Le lezioni di metodo del 27B
+restano in tasca (KL mediana + top-1, mai PPL: 3/3 avrebbe promosso i
+peggiori; imatrix su NVFP4 peggiora, +38 %; q8_0 sulla cache KV è gratis,
+0,99× — limite: KL vista a ctx 512-8192, il long-ctx va provato sul compito).
+**Condizioni di riapertura (tutte e quattro):** (1) residenza totale raggiunta
+e prefill-GEMM misurato come nuovo collo; (2) istogramma hits: hot-set
+abbastanza stabile da far correre ai residenti VRAM il grosso del GEMM;
+(3) d3 verde di qualità vs int4-gs64; (4) il ~2× GEMM giustifica secondo
+formato + container + convertitore.
 
 **Gli esperti caldi non sono un set statico**: l'hotness deriva col carico ⇒
 il tier diventa il livello sommitale dell'LFRU esistente (ammissione/eviction
@@ -545,6 +558,8 @@ restano su CPU.
 
 | | |
 |---|---|
+| 14/09 | **MTP a int4 nel container + banco AVX2 che precede il port** (direttive del titolare). MTP: container uniforme da **25.088 esperti (~69,4 GB)** — quando il percorso speculativo si attiverà i suoi 512 esperti sono già lì in fmt=4 (la mia correzione-tabella di ieri li aveva esclusi in modo incoerente colla riga del re-design a ~69,5 GB: riportati coerenti, percentuali §6.2 su 25.088). AVX2: domanda del titolare — «int4-gs64 è penalizzante su CPU solo-AVX2?» — trasformata in **banco GEMV che precede il port del loader**: forme esatte (gate/up I=2560·O=640, down I=640·O=2560), scalare vs AVX2 vs fp8-D2, S=1/4/12/32. Prior teorico sul 3900X (Zen 2, 256 bit nativi, niente AVX512 e nessuna cosa del disegno lo chiede): a S=1 è DRAM-bound ⇒ −45 % di byte/token (2,25→1,24 GiB) con decode-ALU comparabile (e4m3_decode8 ≈ unpack nibble branchless) e overhead gs64 ≈ +1 mul/64 MAC — **int4-in-slot dovrebbe BATTERE fp8-in-slot**; il rischio vero è la qualità del kernel (pipelining del decode-in-GEMV), quindi banco prima, poi decisione slot packed vs unpack-at-load. Fallback quantificato se banco rosso: unpack-at-load int8 (kernel provato) ⇒ slot 5,2 MiB ⇒ residenza 70 % → ~35-40 %: perde la promessa, non è una via libera. Best case da inseguire: decode pipelinato (decodifica i prossimi 64 B mentre l'fma macina i correnti) + riuso tile per S>1 (D2: riuso 3,1× > vettorizzazione 2,0×). |
+| 14/09 | **NVFP4 declassato: quant UNICA int4-gs64 ovunque** (revisione del pomeriggio, spinta dal titolare: «prima di fare casini con la quant»). Analisi per ruolo: decode GEMV memory-bound a byte identici ⇒ vantaggio zero (ed è l'orizzonte della campagna); capacità identica ⇒ zero; qualità non provata vs gs64 (sul 27B il danno era tutto nelle FFN = ciò che gli esperti sono qui); GEMM prefill = unico vantaggio, ma il percorso int4 standard su sm_120 (dequant-in-kernel + INT8 MMA — tensor core INT4 tolti da sm_89 in poi, `grouped_s4_wmma` = path pre-Ada) lo copre già, NVFP4 ~2× SOLO lì e solo dopo la residenza totale. Il rischio doppio-formato che il titolare ha nominato è reale: caldi in int4-RAM con NVFP4 sul freddo = tutti i costi nessun beneficio — e **lo skew risolve il piazzamento, non il formato**: la promozione dinamica RAM→VRAM deve costare una memcpy, vero solo a formato uniforme. Riapertura solo a 4 condizioni (§6.5). Il tier parte int4: stage() memcpy, kernel fmt=4 già merged. |
 | 14/09 | **Fase 2 ridisegnata: tier a due livelli, obiettivo «residenza totale»** — decisione del titolare: **colibri sostituisce llama.cpp, non convive mai** (il passaggio di modello È 27B → Flash); a cutover la macchina è tutta nostra (32 GiB VRAM + ~55 RAM, sistema ~3) ⇒ **24.576/24.576 esperti residenti in produzione**: VRAM = caldi NVFP4 (~8-9k) + MTP (~2) + head (1,2) + KV q8_0 (~1,6), RAM = resto int4-gs64 (40) + dense (5,4), SSD = solo PLE/ViT/fallback FP8. Lo storm muore, il prefill diventa compute-bound: **lì** il NVFP4 (tensor core sm_120) conta davvero — per il decode GEMV i formati valgono identici (memory-bound, 2,64 MiB/esperto entrambi), la velocità viene dalla residenza. **NVFP4: il verdetto 27B non si eredita** (era denso vs BF16 — la memoria lo delimitava già: «su un MoE si rimisura da zero»), **il metodo sì**: gate d3 KL mediana+top-1 (mai PPL) su `nvidia/...NVFP4` vs int4 nostro vs FP8, imatrix con e senza (sul 27B la PEGGIORAVA, +38 %); rosso ⇒ tier parte int4 (kernel pronti). Bonus ereditato: **q8_0 sulla KV misurato gratis** (0,99×) e f16-K vantaggio inesistente. Hot set = LFRU a tre livelli, non set statico: istogramma hits per dimensionare (serve export del registro). Riferimenti kernel NVFP4 sm_120 già nei sorgenti llama.cpp b10133. Dettagli in §6.5; correzioni tetto RAM (§3, 50-55 GiB a K12 spento) e tabella gs64 (§6.2) committate insieme. |
 | 14/09 | **Fase 1 ri-disegnata sull'ecosistema — gs64 group-scaled, sorgente BF16 in streaming, container esperti-only; e il BF16 esiste** (il §6.3 «un BF16 non esiste» era falso: abbiamo scaricato il derivato FP8, il master `Qwen/Qwen3.8-Flash-Next` rev `de4b8e4d` È il BF16, stessa struttura a 131 shard). Quattro repo HF esaminati — Kreuzzelg qwen36 i4-gs64 (KL 0,0795 / cosine 0,99313 vs int8, il group scaling taglia l'errore logit del 44 % sul per-row), JustVugg GLM-5.3-Flash int4-gs64 («within noise of int8», convertitore `tools/convert_glm53.py`: 25 h per 194,7 GB, picco disco = output + un shard), ivanfioravanti DS4-Q4 **del nostro modello** (Q4_K imatrix gate/up + MXFP4 down, vs BF16: MAE 0,0431 / top-1 96,6 %, Q8_0 0,0211/98,7 %; e il primo dato **MTP misurato**: 45,4 → 55-56 tok/s a un solo draft token per ciclo, 98 % acceptance su math — le chain multi-token con verify S=k+1 sono territorio nostro, D1: S=32 7,5×), nvidia NVFP4 ufficiale esperti-only (CPU non lo decodifica: solo combo VRAM). **Decisioni**: gs64 al posto di gs128 (+4 GB su ~70, qualità misurata); sorgente BF16 shard-a-shard (un solo salto di quant, mai i 330 GB a terra; fallback FP8); container = soli esperti ~69,5 GB con dense/PLE sugli shard FP8 esistenti (PLE mai toccata, 24 zero-expert con fallback deterministico); arbitro di banco = FP8 nativo + ancore esterne. **E il perimetro si è sgonfiato**: `matmul_q_gs` + `expert_gs` sono GIÀ merged nel nostro albero (`qwen36.c:1022/1416`), i convertitori esistono (`c/tools/convert_qwen36.py`, `convert_fp8_to_int4.py`), disco 334 GB liberi — la Fase 1 è adattare, non scrivere da zero. Dettagli e scarti (cyankiwi AWQ full-model, MXFP4 grouped assente) in §6.4. Finestra chiusa fino alle 18: il tier A/B, gli oracle CUDA e lo split 4/4 aspettano la riapertura; nel frattempo ricognizione del port e convertitore subset. |
 | 14/09 | **Scomposizione di `routed-expert` CHIUSA — la fault storm è I/O sincrono, non aritmetica, e nemmeno lavoro di page-table** (la domanda aperta della leva D: 27,1 s su 42,7 di TTFT di cui solo 0,95 s di servizio disco misurato; due diagnosi opposte, due leve opposte — matmul fp8 lento o fault impliciti del mapping — e finché non erano separate ogni mossa successiva era una scommessa). **Disegno**: quattro run `N_NEW=1` cap 32, D2 acceso ovunque, `COLI_CUDA=0`, 20 thread, stessa selezione in tutte (hit 404 / miss 38928, riga I/O identica); unica variabile `COLI_MAP_EXPERTS` — sotto mmap il primo tocco dei byte dell'esperto avviene DENTRO il matmul e il fault viene addebitato a `routed-expert`, sotto copia i byte arrivano espliciti e finiscono in `expert-read`; la differenza fra i due `routed-expert` è il tempo di fault (coppie adiacenti M1-C1, M2-C2). **Risultato**: mmap **33,76/29,88 s** contro copia **9,87/9,88 s** — l'aritmetica fp8 vera è ~9,9 s, i fault valgono **20,0-23,9 s = 44-53 % del TTFT**: il primo costo del prefill, più grosso del matmul stesso. **Il discrimine major/minor** (`/usr/bin/time -v` + Δ`pgmajfault` di sistema, scope `MemorySwapMax=0`): run mmap **848.410 major fault** (Δ sistema 849.723 — il processo li rende conto al 99,9 %), run copia **8**; minor comparable (4,08 M contro 4,92 M) ⇒ non è granularità di pagina: **sono stalli di I/O veri dentro il matmul** — le leve hugepage/`MADV_HUGEPAGE` muoiono qui (il costo non è la tabella, è il disco dietro), e il readahead del kernel ci sta già provando: è il motivo per cui mmap vince comunque il TTFT (50,0 contro 58,5 s) pur pagando la stessa roba dentro il timer. `fp8-expand` a zero in tutte le run: nessun lavoro di miss fuori dal matmul, come da nota d'architettura. **Riconciliazione con la nota 0.3** («mmap sposta il costo del fault fra i contatori, non lo elimina»): ora quantificato — mmap 0,94 s di `expert-read` + 34,1 s di `routed-expert` contro copia 30,1 + 12,4 (aritmetica più rumorata in questa coppia: banda 9,9-12,4 s). **Conseguenza di roadmap**: il costo #1 del prefill è latenza di I/O seriale, non calcolo — la leva che lo attacca è la sovrapposizione acquisizione/calcolo (prefill expert-major + acquisizione batched, 410842e+871d793), finora parcheggiata come pezzo del percorso GPU ma il cui beneficio qui misurato è **CPU-side e misurabile senza finestra**. Banco: `d5_fault.sh` (scomposizione) + `d6_fault.sh` (discrimine) con i run `d5_*.txt` e `d6_{M_mmap,C_copy}.txt`. |
