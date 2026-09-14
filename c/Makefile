@@ -1855,6 +1855,14 @@ tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h t
 tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# bench_qwen38_int4_gemv: microbenchmark (int4-gs64 expert GEMV, scalar vs AVX2 vs
+# AVX2-with-tile-reuse, against the engine's own fp8 kernel), NOT a test gate.
+# Header-only sources on purpose: qwen38_matmul.h needs no Model, so the bank
+# drives the real kernels directly. Build on demand:
+#   make tests/bench_qwen38_int4_gemv ARCH=native
+tests/bench_qwen38_int4_gemv$(EXE): tests/bench_qwen38_int4_gemv.c qwen38_matmul.h quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
 tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
