@@ -1777,6 +1777,12 @@ tests/test_qwen38_tier_fill_wait$(EXE): tests/test_qwen38_tier_fill_wait.c tests
 tests/test_qwen38_simd_matmul$(EXE): tests/test_qwen38_simd_matmul.c qwen38_matmul.h quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+# Blocked AVX2 int4 kernel for the gs64 expert container: bit-identity under
+# batch split (incl. S>64), backward accuracy vs the scalar reference, and
+# counter-proofs for the two wrong decodings.
+tests/test_qwen38_i4_matmul$(EXE): tests/test_qwen38_i4_matmul.c qwen38_matmul.h quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

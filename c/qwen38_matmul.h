@@ -130,6 +130,61 @@ static void q38_matmul_fp8_avx2(float *y,const float *x,const uint8_t *q8,
     }
 }
 
+/* Grouped int4 (gs64 expert container), same blocking as fp8: one group of
+ * weights is decoded into a stack tile once and the whole batch chunk is
+ * served from it.  The bank (bench_qwen38_int4_gemv) measured the unblocked
+ * form at 0.44-0.66x of fp8-D2 for S>=4 precisely because it re-decoded each
+ * group per batch row; this form is the fourth arm (1.05-1.20x fp8 at S=4/12,
+ * parity at S=32).  At S=1 it degenerates to the plain vector decode with one
+ * tile buffer: 133.7 vs 134.0 GFLOP/s in the bank, i.e. free.  Accumulation
+ * is float inside a group and double across groups, mirroring the fp8 kernel;
+ * the result is bit-identical to itself under any batch split (row
+ * accumulators reset per chunk) and closer to a float64 reference than
+ * matmul_i4_grouped's float-throughout accumulation. */
+static void q38_matmul_i4_avx2(float *y,const float *x,const uint8_t *q4,
+                               const float *scales,int gs,int S,int I,int O) {
+    if(gs>64){fprintf(stderr,"q38_matmul_i4_avx2: gs=%d exceeds tile\n",gs);exit(1);}
+    int ng=(I+gs-1)/gs;
+    const __m128i m4=_mm_set1_epi8(0x0F);
+    const __m256i b8=_mm256_set1_epi32(8);
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*((I+1)/2);
+        const float *scl=scales+(int64_t)o*ng;
+        float tile[64];              /* the container pins gs=64 */
+        for(int r0=0;r0<S;r0+=Q38_MV_ROWS){
+            int nr=S-r0<Q38_MV_ROWS?S-r0:Q38_MV_ROWS;
+            double a[Q38_MV_ROWS];
+            for(int r=0;r<nr;r++)a[r]=0;
+            for(int g=0;g*gs<I;g++){
+                int base=g*gs,blen=gs;
+                if(base+blen>I)blen=I-base;
+                int k=0;
+                for(;k+16<=blen;k+=16){
+                    __m128i by=_mm_loadl_epi64((const __m128i*)(w+((base+k)>>1)));
+                    __m128i lo=_mm_and_si128(by,m4);
+                    __m128i hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    _mm256_storeu_ps(tile+k,
+                        _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                            _mm256_cvtepu8_epi32(nib),b8)));
+                    _mm256_storeu_ps(tile+k+8,
+                        _mm256_cvtepi32_ps(_mm256_sub_epi32(
+                            _mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8)));
+                }
+                for(;k<blen;k++){
+                    uint8_t byte=w[(base+k)>>1];
+                    tile[k]=(float)((int)((base+k)&1?byte>>4:byte&0xF)-8);
+                }
+                float sc=scl[g];
+                for(int r=0;r<nr;r++)
+                    a[r]+=(double)q38_dot8(tile,x+(int64_t)(r0+r)*I+base,blen)*sc;
+            }
+            for(int r=0;r<nr;r++)y[(int64_t)(r0+r)*O+o]=(float)a[r];
+        }
+    }
+}
+
 static void q38_matmul_bf16_avx2(float *y,const float *x,const uint16_t *W,
                                  int S,int I,int O) {
     #pragma omp parallel for schedule(static)
