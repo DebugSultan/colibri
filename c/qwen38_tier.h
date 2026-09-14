@@ -42,11 +42,12 @@
  *
  * The main gain is not the matmul: it is that a VRAM hit does NOT touch the
  * disk. The engine notes the routing for all K, issues the residents and
- * loads into RAM only the missing ones. With ~4.69 MiB per expert
- * (3*2560*640 bytes plus 300 scales) and a ~29 GB budget on two 16 GB
- * cards, about 6,300 of the 24,576 experts fit in VRAM: that fraction of
- * misses disappears from the expert-read path, which Phase 0.3 showed to be
- * the dominant cost.
+ * loads into RAM only the missing ones. With 6.02 MiB per expert at
+ * cudaMalloc granularity (3*2560*640 bytes plus 300 scales charged by
+ * dev_alloc_footprint, not by payload) and a ~12.5 GiB budget per 16 GB
+ * card (free minus the backend reserve), about 4,300 of the 24,576 experts
+ * fit in VRAM: that fraction of misses disappears from the expert-read
+ * path, which the measurements showed to be the dominant cost.
  *
  * Order of use in decode (S=1):
  *
@@ -62,7 +63,7 @@
  * asynchronous issue; it is not yet exposed here, it comes after measuring
  * decode.
  *
- * Activation: COLI_CUDA=1 [COLI_GPUS=0,1] [CUDA_EXPERT_GB=<G>|auto]
+ * Activation: COLI_CUDA=1 [COLI_GPUS=0,1 | COLI_GPU=0] [CUDA_EXPERT_GB=<G>|auto]
  * [HEAT_FILE=<path>] [Q38T_NO_WARMSTART=1]. Compiled only when the build
  * defines -DCOLI_CUDA (CUDA=1); otherwise the inline stubs below keep the
  * engine on CPU at zero cost, as qwen36_tier.h does. */

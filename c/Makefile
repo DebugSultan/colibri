@@ -1756,6 +1756,15 @@ tests/test_qwen36_tier_autoplace$(EXE): tests/test_qwen36_tier_autoplace.c tests
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c tests/qwen36_fake_cuda.h qwen36_tier.c qwen36_tier.h backend_cuda.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# The qwen38 tier has no GPU in CI either: the same fake-backend pattern runs
+# the accounting (cudaMalloc granularity), budget-clamp, COLI_GPU, plan-
+# cancel and fill-wait invariants without a device.
+tests/test_qwen38_tier$(EXE): tests/test_qwen38_tier.c tests/qwen38_fake_cuda.h qwen38_tier.c qwen38_tier.h backend_cuda.h compat.h tier.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+tests/test_qwen38_tier_fill_wait$(EXE): tests/test_qwen38_tier_fill_wait.c tests/qwen38_fake_cuda.h qwen38_tier.c qwen38_tier.h backend_cuda.h compat.h tier.h quant.h
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 

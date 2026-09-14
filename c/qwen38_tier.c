@@ -46,6 +46,10 @@ static struct {
     /* upload queue with staging copies */
     struct { int layer, eid; uint8_t *w; float *s; int v_layer, v_eid; } q[Q38T_QCAP];
     int qh, qt_, qn;
+    /* Enqueued and not yet resident. qn frees the ring slot at DEQUEUE time,
+     * before the backend copy runs, so "queue empty" is not "all resident"
+     * (the warmstart path waits on this one, #1360's class of defect). */
+    int inflight;
     pthread_cond_t cv;
     pthread_cond_t cv_take;               /* queue space + qt_take done */
     /* statistics */
@@ -131,7 +135,8 @@ static void *uploader(void *arg){
                   * can still read; the resident flag had already been turned
                   * off by the one who queued, so it is put back the way it
                   * was. */
-                v->resident=1; qs(layer,eid)->queued=0;
+                v->resident=1; qs(layer,eid)->queued=0; G.inflight--;
+                pthread_cond_broadcast(&G.cv_take);
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*c=v->td;
@@ -161,11 +166,56 @@ static void *uploader(void *arg){
                 if(tu)coli_cuda_tensor_free(tu);
                 if(td)coli_cuda_tensor_free(td); }
         s->queued=0; s->planned=0;
+        G.inflight--;
+        pthread_cond_broadcast(&G.cv_take);          /* this upload is complete */
         pthread_mutex_unlock(&G.mx);
     }
 }
 
 /* --- init ---------------------------------------------------------------- */
+
+/* Thread affinity around the tier's own threads (Linux).
+ *
+ * With OMP_PROC_BIND set, libgomp binds the initial thread to place 0 before
+ * main() runs, and a pthread inherits the CPU mask of the thread that creates
+ * it. The uploader thread and the CUDA runtime's own threads were therefore
+ * jailed on the OpenMP master's core: every staging copy and every driver
+ * call competed with the master thread's share of each expert matmul, and
+ * the whole team waited for it. Measured on Qwen3.8 upstream (12 threads, one
+ * card): the CPU time per remaining expert rose 64 % while the tier was on,
+ * eating the whole gain of computing 45-59 % of the experts on the GPU. So
+ * the tier widens the calling thread's mask to every online CPU while it
+ * creates its thread and initializes CUDA, and restores the caller's mask
+ * afterwards. Raw syscalls, no _GNU_SOURCE: this file is also #included by
+ * tests after the engine's own headers. Same fix as qwen36_tier.c
+ * (792b6f2); this branch runs 20 OpenMP threads by default. */
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/syscall.h>
+#define Q38T_AFF_WORDS 64                             /* 4096 CPUs */
+typedef struct { unsigned long w[Q38T_AFF_WORDS]; int len; } q38t_affmask;
+static int q38t_aff_get(q38t_affmask *m){
+    long r=syscall(SYS_sched_getaffinity,0,sizeof m->w,m->w);
+    if(r<=0) return 0;
+    m->len=(int)r; return 1;
+}
+static void q38t_aff_widen(const q38t_affmask *saved){
+    if(!saved->len) return;
+    long n=sysconf(_SC_NPROCESSORS_ONLN);
+    if(n<=1) return;
+    q38t_affmask all; memset(&all,0,sizeof all);
+    for(long i=0;i<n && i<(long)(8*sizeof all.w);i++) all.w[i/(8*sizeof(unsigned long))] |= 1ul<<(i%(8*sizeof(unsigned long)));
+    syscall(SYS_sched_setaffinity,0,(size_t)saved->len,all.w);
+}
+static void q38t_aff_restore(const q38t_affmask *saved){
+    if(saved->len) syscall(SYS_sched_setaffinity,0,(size_t)saved->len,saved->w);
+}
+#else
+typedef struct { int len; } q38t_affmask;
+static int  q38t_aff_get(q38t_affmask *m){ (void)m; return 0; }
+static void q38t_aff_widen(const q38t_affmask *m){ (void)m; }
+static void q38t_aff_restore(const q38t_affmask *m){ (void)m; }
+#endif
 
 /* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
  * see the exp_bytes computation in q38t_init). */
@@ -211,7 +261,12 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.sc=(size_t)scale_count;
     G.mat_bytes=(size_t)D*(size_t)Ih;
 
+    /* Devices: COLI_GPUS="0,1" (default: first two visible devices).
+     * COLI_GPU is the singular the planner writes for a one-device plan;
+     * accepting it too means a planner-written list selects a device instead
+     * of silently selecting none. */
     const char *gl=getenv("COLI_GPUS");
+    if(!gl || !*gl) gl=getenv("COLI_GPU");
     if(gl && *gl){
         char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
         for(char *t=strtok(buf,","); t && G.ndev<Q38T_MAX_DEV; t=strtok(NULL,","))
@@ -223,6 +278,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
         fprintf(stderr,"[q38tier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
     }
     if(G.ndev<1){ fprintf(stderr,"[q38tier] no visible CUDA devices -> CPU path\n"); return 0; }
+    q38t_affmask aff; q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* CUDA's threads are born here */
     if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[q38tier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
     if(have<G.ndev) G.ndev=have;
@@ -234,6 +290,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
         fprintf(stderr,"[q38tier] coli_cuda_fp8_set_lut failed -> CPU path\n");
         return 0;
     }
+    q38t_aff_restore(&aff);
 
     /* Charge what the device allocator takes, not what the bytes measure:
      * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB,
@@ -260,9 +317,20 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
+        /* An explicit budget above what the card can still take made every
+         * upload fail until the uploader's clamp kicked in (#1411's lesson):
+         * the ceiling is min(requested, measured headroom), and the banner
+         * says so. */
+        size_t headroom = freeb>Q38T_DEV_RESERVE ? freeb-Q38T_DEV_RESERVE : 0;
         size_t b = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>Q38T_DEV_RESERVE ? freeb-Q38T_DEV_RESERVE : 0);
+                   : headroom;
+        if(b>headroom){
+            fprintf(stderr,"[q38tier] dev %d: explicit budget %.1f GB above the "
+                           "measured headroom %.1f GB, clamped\n",
+                    G.dev[i], b/1073741824.0, headroom/1073741824.0);
+            b=headroom;
+        }
         G.budget[i]=b;
         fprintf(stderr,"[q38tier] dev %d: %.1f GB free, budget %.1f GB (~%zu experts)\n",
                 G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
@@ -292,7 +360,9 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     pthread_mutex_init(&G.mx,NULL);
     pthread_cond_init(&G.cv,NULL);
     pthread_cond_init(&G.cv_take,NULL);
+    q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* the uploader inherits this mask */
     if(pthread_create(&G.th,NULL,uploader,NULL)!=0){ free(G.slot); free(G.is_x); return 0; }
+    q38t_aff_restore(&aff);
     G.on=1;
     fprintf(stderr,"[q38tier] CUDA VRAM expert tier active: %d device(s), "
                    "%.2f MB/expert, %d experts total\n",
@@ -348,7 +418,7 @@ static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,
     G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid;
     G.q[G.qt_].w=w;         G.q[G.qt_].s=sc;
     G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
-    G.qt_=(G.qt_+1)%Q38T_QCAP; G.qn++;
+    G.qt_=(G.qt_+1)%Q38T_QCAP; G.qn++; G.inflight++;
     qs(layer,eid)->queued=1;
     pthread_cond_signal(&G.cv);
     return 1;
@@ -575,7 +645,7 @@ void q38t_cancel_plan(int layer,int eid){
 void q38t_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
-    while(G.qn>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
     pthread_mutex_unlock(&G.mx);
 }
 
