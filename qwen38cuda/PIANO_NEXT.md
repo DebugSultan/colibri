@@ -379,11 +379,11 @@ f32 per 64):**
 
 | livello | contenuto | GiB |
 |---|---|---|
-| VRAM | ~8-9k esperti caldi **int4** + MTP (~2) + head (1,2) + KV q8_0 (~1,6) | ~27-30 |
-| RAM | ~15,5k esperti int4 (40) + dense (5,4) + workspace (2-3) | ~47-49 |
+| VRAM | ~8,5k esperti caldi **int4** (~22,4) + MTP int4 (~1,5) + head (1,2) + KV q8_0 (~1,6) | ~27-28 |
+| RAM | ~16,5k esperti int4 (~44) + dense (5,4) + workspace (2-3) | ~50-52 |
 | SSD | PLE (47,75) + ViT + fallback FP8 | — |
 
-Totale esperti residenti: **24.576/24.576**. Lo storm sparisce; il prefill
+Totale esperti residenti: **25.088/25.088**. Lo storm sparisce; il prefill
 batched diventa compute-bound ⇒ lì il GEMM accelera, con la strada standard
 su sm_120: dequant-in-kernel + INT8 MMA (i tensor core INT4 non esistono più
 da sm_89; il `grouped_s4_wmma` wmma-s4 del codice è path pre-Ada). Per il
@@ -416,14 +416,25 @@ formato + container + convertitore.
 
 **Gli esperti caldi non sono un set statico**: l'hotness deriva col carico ⇒
 il tier diventa il livello sommitale dell'LFRU esistente (ammissione/eviction
-dinamiche, copia NVFP4 materializzata all'upload); l'istogramma per-esperto
+dinamiche, copia int4 uploadata con una memcpy); l'istogramma per-esperto
 su carichi rappresentativi dimensiona il set VRAM (ancore: upstream 6 %
 residenza → 53,8 % hit; le nostre curve 0.3). Serve export del registro hits
 (piccolo patch).
 
-**Riferimenti implementativi**: llama.cpp b10133 HA già il percorso NVFP4
-sm_120 completo (GGML_TYPE_NVFP4 = 40, `mmq-config-blackwell.cuh`, gate MMA
-`>= 1200`) — sorgente di studio per i kernel grouped NVFP4 (Fase 2b), così
+**La testa, e l'anomalia che la guarda** (da risolvere prima della Fase 2):
+`lm_head` è UN solo tensore BF16 da **1,18 GiB** (~248k vocab) e viene
+attraversato per intero a ogni token. Ma 1,18 GiB/step a ~45 GB/s di DRAM
+vorrrebbe ~26 ms/step = ~38 tok/s SOLO per la testa, mentre il banco misurato
+dice 54 tok/s TOTALI con la testa su CPU. L'accounting non torna: o il motore
+la tiene già in un formato più stretto (qdw-int8?), o c'è riuso/cache non
+contabilizzato. **Prima di spostarla in VRAM (candidata naturale), una
+riga-timer la accerta** — altrimenti si progetta la Fase 2 su un
+presupposto falso.
+
+**Riferimenti implementativi**: il percorso standard int4 su sm_120
+(dequant-in-kernel + INT8 MMA) non ha bisogno di nulla di nuovo; per la
+riapertura condizionata del NVFP4 restano in tasca llama.cpp b10133 (GGML_TYPE_NVFP4 = 40, `mmq-config-blackwell.cuh`, gate MMA
+`>= 1200`) come sorgente di studio per i kernel grouped FP4, così
 come cuBLASLt FP4 per il GEMM di prefill. Gotchi ereditati che restano: P2P NS
 fra le schede + 5060 Ti su link chipset x4 (upload una tantum per stage,
 compute residente ⇒ PCIe ammortizzato); `CUDA_VISIBLE_DEVICES` invertito
