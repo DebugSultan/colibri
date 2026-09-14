@@ -1002,11 +1002,36 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+static int q38_cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
     if (nfull <= np) {
         fprintf(stderr, "PPL requires full_ids to extend prompt_ids\n");
         exit(1);
+    }
+    /* d3 quality gate: per-position sidecar so a second arm can compute the
+     * teacher-forced KL surrogate (nll_int4 - nll_fp8) and top-1 agreement on
+     * the identical token stream. 8 bytes per scored position. */
+    const char *tf_path = getenv("Q38_TF_TRACE");
+    const char *tf_ref = getenv("Q38_TF_REF");
+    FILE *tf_out = tf_path && *tf_path ? fopen(tf_path, "wb") : NULL;
+    float *ref_nll = NULL; int *ref_top = NULL; int ref_n = 0;
+    if (tf_ref && *tf_ref) {
+        FILE *rf = fopen(tf_ref, "rb");
+        if (!rf) { fprintf(stderr, "Q38_TF_REF: cannot open %s\n", tf_ref); exit(1); }
+        fseek(rf, 0, SEEK_END); long sz = ftell(rf); fseek(rf, 0, SEEK_SET);
+        ref_n = (int)(sz / 8);
+        ref_nll = malloc((size_t)ref_n * sizeof(float));
+        ref_top = malloc((size_t)ref_n * sizeof(int));
+        if (fread(ref_nll, sizeof(float), (size_t)ref_n, rf) != (size_t)ref_n ||
+            fread(ref_top, sizeof(int), (size_t)ref_n, rf) != (size_t)ref_n) {
+            fprintf(stderr, "Q38_TF_REF: short read on %s\n", tf_ref); exit(1);
+        }
+        fclose(rf);
     }
     m->max_t = q38_context_total(c, np, nfull - np, "PPL");
     q38_validate_ids(c, full, nfull, "full_ids");
@@ -1014,17 +1039,39 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     ensure_kv(m);
     m->kv_len = 0;
     double nll = 0; int scored = 0;
+    double *kl = ref_nll ? malloc((size_t)ref_n * sizeof(double)) : NULL;
+    int top1_match = 0; double kl_max = 0;
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
-        float mx = logit[0]; for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) mx = logit[v];
+        float mx = logit[0]; int am = 0;
+        for (int v = 1; v < c->vocab; v++) if (logit[v] > mx) { mx = logit[v]; am = v; }
         double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)logit[v] - mx);
-        nll += -((double)logit[full[i]] - mx - log(Z));
+        double tok_nll = -((double)logit[full[i]] - mx - log(Z));
+        nll += tok_nll;
+        if (tf_out) { float f = (float)tok_nll; fwrite(&f, 4, 1, tf_out); fwrite(&am, 4, 1, tf_out); }
+        if (ref_nll && scored < ref_n) {
+            double k = tok_nll - (double)ref_nll[scored];
+            kl[scored] = k; if (k > kl_max) kl_max = k;
+            if (am == ref_top[scored]) top1_match++;
+        }
         scored++;
         free(logit); logit = NULL;
         if (i == nfull - 1) break;
         logit = step(m, &full[i], 1, i);
     }
     if (logit) free(logit);
+    if (tf_out) fclose(tf_out);
+    if (kl) {
+        int n = scored < ref_n ? scored : ref_n;
+        qsort(kl, (size_t)n, sizeof(double), (int(*)(const void*,const void*))q38_cmp_double);
+        double kl_med = kl[n/2], kl_mean = 0;
+        for (int i = 0; i < n; i++) kl_mean += kl[i];
+        kl_mean /= n;
+        printf("TF-KL: median %.4f | mean %.4f | max %.4f | top1 %.2f%% (%d/%d)\n",
+               kl_med, kl_mean, kl_max, 100.0*top1_match/n, top1_match, n);
+        free(kl);
+    }
+    free(ref_nll); free(ref_top);
     *nll_out = nll / scored;
     return scored;
 }
