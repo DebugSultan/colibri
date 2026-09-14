@@ -50,11 +50,27 @@ class ConvertGuardTest(unittest.TestCase):
                                 "FP8" in message,
                                 f"{model_type}: refusal has no pointer:\n{message}")
 
-    def test_qwen38_refusal_says_no_conversion_exists(self):
-        with self.assertRaises(SystemExit) as caught:
-            check_model_family({"model_type": "qwen4_exp"}, "Qwen/Qwen3.8-Flash-Next")
-        self.assertIn("NOT converted", str(caught.exception))
-        self.assertIn("FP8", str(caught.exception))
+    def test_refusal_names_the_converter_the_registry_declares(self):
+        """Dove il registry nomina un convertitore, il rifiuto deve mandare LI'.
+
+        Prima questo test fissava la stringa esatta del messaggio di Qwen3.8
+        ("NOT converted ... FP8"), che era vera finche' quella famiglia girava
+        sul solo checkpoint ufficiale. Con tools/convert_qwen38_int4.py e'
+        diventata falsa, e una stringa letterale in un test si aggiorna a mano:
+        cioe' non e' un contratto, e' una nota. Il contratto e' che le due mappe
+        non divergano, quindi lo si chiede al registry invece di riscriverlo.
+        """
+        for family in FAMILIES:
+            if family.id == "glm" or not family.converter:
+                continue
+            for model_type in family.model_types:
+                with self.assertRaises(SystemExit) as caught:
+                    check_model_family({"model_type": model_type}, "some/repo")
+                message = str(caught.exception)
+                self.assertIn(
+                    family.converter, message,
+                    f"{model_type}: il registry lo manda a tools/{family.converter}, "
+                    f"la guardia dice altro:\n{message}")
 
     def test_unknown_and_missing_types_are_refused_not_guessed(self):
         for config in ({"model_type": "llama"}, {"model_type": ""}, {}):

@@ -102,10 +102,15 @@ class FamilyDescriptor:
     # Vuoto significa "coli non guida questa famiglia": non e' una lacuna, e'
     # che il suo convertitore ha un'altra riga di comando (convert_qwen36.py usa
     # --out e --gs, convert_inkling_int4.py non ha --repo) o non serve affatto
-    # (Qwen3.8 gira sul checkpoint ufficiale). In quel caso si lascia parlare la
-    # guardia del convertitore, che quelle indicazioni le ha gia' per famiglia e
-    # sotto test: due copie della stessa mappa sarebbero il difetto che questa
-    # correzione sta chiudendo.
+    # (DeepSeek V4.1 spedisce gia' gli esperti fp4). In quel caso si lascia
+    # parlare la guardia del convertitore, che quelle indicazioni le ha gia' per
+    # famiglia e sotto test: due copie della stessa mappa sarebbero il difetto
+    # che questa correzione sta chiudendo.
+    #
+    # Qwen3.8 stava in quel secondo gruppo finche' girava sul solo checkpoint
+    # ufficiale FP8. Ora ha tools/convert_qwen38_int4.py, che prende --repo,
+    # --outdir e --group-size come convert_glm53.py, quindi coli lo guida: il
+    # criterio e' la riga di comando, non l'anzianita' della famiglia.
     converter: str = ""
     converter_accepts: tuple = ()
     converter_mtp_pass: bool = False
@@ -1239,6 +1244,15 @@ FAMILIES = (
         id="qwen38",
         model_types=("qwen4_exp", "qwen4_exp_text"),
         display_name="Qwen3.8-Flash-Next",
+        # Niente ebits/io_bits/xbits: il contenitore int4 tiene SOLO gli esperti
+        # e i densi restano quelli del checkpoint FP8, montato a fianco. Le tre
+        # opzioni non avrebbero nulla su cui agire, e accettarle per ignorarle
+        # sarebbe la versione silenziosa dello stesso guasto.
+        converter="convert_qwen38_int4.py",
+        converter_accepts=("group_size",),
+        # La testa MTP e' un'unita' del piano come gli altri 48 layer MoE, non
+        # un secondo passaggio: il convertitore la scrive nello stesso run.
+        converter_mtp_pass=False,
         display_scale="176B",
         engine_artifact="qwen38",
         engine_aliases=(),
