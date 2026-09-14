@@ -89,8 +89,8 @@ int main(void)
      * Same three contract points, opposite sizing. The floor at `physical`
      * means a non-SMT host must come out exactly where the other policy
      * leaves it, which is why `want` collapses to `logical` there. */
-    env_unset("OMP_NUM_THREADS");
-    env_unset("COLI_NO_OMP_TUNE");
+    unsetenv("OMP_NUM_THREADS");
+    unsetenv("COLI_NO_OMP_TUNE");
     omp_set_num_threads(logical);
     coli_omp_tune_threads_smt("test", 2);
     got = omp_get_max_threads();
@@ -123,22 +123,22 @@ int main(void)
     }
 
     omp_set_num_threads(sentinel);
-    env_set("OMP_NUM_THREADS", "7");
+    setenv("OMP_NUM_THREADS", "7", 1);
     coli_omp_tune_threads_smt("test", 2);
     if (omp_get_max_threads() != sentinel) {
         fprintf(stderr, "smt sizing ignored an explicit OMP_NUM_THREADS\n");
         fail = 1;
     }
-    env_unset("OMP_NUM_THREADS");
+    unsetenv("OMP_NUM_THREADS");
 
     omp_set_num_threads(sentinel);
-    env_set("COLI_NO_OMP_TUNE", "1");
+    setenv("COLI_NO_OMP_TUNE", "1", 1);
     coli_omp_tune_threads_smt("test", 2);
     if (omp_get_max_threads() != sentinel) {
         fprintf(stderr, "smt sizing ignored the COLI_NO_OMP_TUNE kill switch\n");
         fail = 1;
     }
-    env_unset("COLI_NO_OMP_TUNE");
+    unsetenv("COLI_NO_OMP_TUNE");
 
     if (fail) {
         puts("test_omp_tune: FAIL");
