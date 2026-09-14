@@ -6,6 +6,8 @@
 #define QWEN38_NO_MAIN
 #define COLI_SEGMENT_ADAPTER
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "../qwen38.c"
 
 #define CHECK(x) do { if(!(x)){ \
@@ -572,7 +574,37 @@ static int check_segment_failure_outputs(void){
     return 0;
 }
 
-int main(void){
+/* Which dispatch arm this process is exercising.  q38_weight_matmul reads
+ * Q38_SIMD_MATMUL once and caches it, so the two arms cannot both run in one
+ * process; main forks and runs everything twice. */
+static int vector_arm;
+
+/* Agreement between a dispatch result and the independent reference above.
+ *
+ * The reference kernels are bit-identical to it and stay held to that.  The
+ * vector kernels are not and cannot be: they accumulate a quantisation block
+ * in four parallel chains rather than one serial chain, which is a different
+ * summation order -- and a measurably more accurate one, ~2.7x closer to a
+ * long double reference on the shapes this engine uses.  So the vector arm is
+ * held to a relative bound instead, scaled by the largest output rather than
+ * by each element, because a dot product that cancels to near zero would make
+ * an elementwise ratio measure the cancellation instead of the kernel.
+ *
+ * Only the two comparisons against this independent reference distinguish the
+ * arms.  Every other check in this file compares one engine path against
+ * another -- batched against serial, prefill against decode -- and those stay
+ * bit-exact in both arms, which is the stronger property: the vector kernels
+ * are bit-identical to themselves under any split of the batch. */
+static int matmul_agrees(const float *want,const float *got,int count){
+    if(!vector_arm)return !memcmp(want,got,(size_t)count*sizeof(float));
+    double scale=0.0;
+    for(int i=0;i<count;i++)if(fabs(want[i])>scale)scale=fabs(want[i]);
+    if(scale<1e-30)scale=1e-30;
+    for(int i=0;i<count;i++)if(fabs(want[i]-got[i])>1e-6*scale)return 0;
+    return 1;
+}
+
+static int run_all(void){
     enum { S=2, I=257, O=129 };
     Q38Weight fp8={0};q38_weight_reserve(&fp8,Q38_WEIGHT_FP8,O,I);
     CHECK(fp8.scale_count==6);CHECK(q38_weight_bytes(&fp8)==(uint64_t)O*I+6*sizeof(float));
@@ -584,7 +616,7 @@ int main(void){
     float want[S*O],got[S*O];
     reference_fp8_matmul(want,x,raw,fp8.scales,S,I,O);
     q38_weight_matmul(got,x,&fp8,S,I,O);
-    CHECK(!memcmp(want,got,sizeof want));
+    CHECK(matmul_agrees(want,got,S*O));
     void *same=fp8.data;q38_weight_reserve(&fp8,Q38_WEIGHT_FP8,O,I);
     CHECK(fp8.data==same);
     q38_weight_free(&fp8);CHECK(fp8.kind==Q38_WEIGHT_NONE&&!fp8.data&&!fp8.scales);
@@ -600,7 +632,7 @@ int main(void){
     for(int i=0;i<BS*BI;i++)bx[i]=(float)((i%7)-3)*0.25f;
     q38_matmul(bwant,bx,full,BS,BI,BO);
     q38_weight_matmul(bgot,bx,&bf16,BS,BI,BO);
-    CHECK(!memcmp(bwant,bgot,sizeof bwant));
+    CHECK(matmul_agrees(bwant,bgot,BS*BO));
     float row[BI];q38_weight_row(&bf16,2,row);
     CHECK(!memcmp(row,full+2*BI,sizeof row));
     CHECK(q38_weight_bytes(&bf16)==(uint64_t)BO*BI*sizeof(uint16_t));
@@ -646,6 +678,26 @@ int main(void){
 
     CHECK(check_segment_failure_outputs()==0);
 
-    puts("qwen38 native weights: FP8 oracle, coalesced slabs/scales, parallel demand sets, fallbacks, adapter failures: ok");
+    printf("qwen38 native weights (%s kernels): FP8 oracle, coalesced slabs/scales, parallel demand sets, fallbacks, adapter failures: ok\n",
+           vector_arm?"vector":"reference");
     return 0;
+}
+
+/* Run the whole file once per dispatch arm.  The fork precedes every OpenMP
+ * region, so each process builds its own runtime rather than inheriting one. */
+int main(void){
+    pid_t child=fork();
+    if(child<0){fprintf(stderr,"fork failed\n");return 1;}
+    if(child==0){
+        if(setenv("Q38_SIMD_MATMUL","0",1)!=0){
+            fprintf(stderr,"setenv failed\n");return 1;
+        }
+        return run_all();
+    }
+    int status=0;
+    if(waitpid(child,&status,0)!=child||!WIFEXITED(status)||WEXITSTATUS(status)!=0){
+        fprintf(stderr,"reference-kernel arm failed\n");return 1;
+    }
+    vector_arm=1;
+    return run_all();
 }

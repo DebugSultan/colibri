@@ -1067,7 +1067,7 @@ QWEN38_TIER_SRC =
 QWEN38_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN38_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_tier.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN38_TIER_SRC) $(CUDA_OBJ)
+qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_matmul.h qwen38_tier.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN38_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN38_CFLAGS) qwen38.c $(QWEN38_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN38_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1202,13 +1202,13 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 tests/test_st_slice$(EXE): tests/test_st_slice.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
@@ -1230,13 +1230,13 @@ qwen38-vision-serve-check: qwen38$(EXE)
 	$(PYTHON) tools/make_edge_tiny_tokenizer.py --vocab-size 64 ./qwen38_mm_tiny
 	$(PYTHON) tests/test_qwen38_vision_serve.py --binary ./qwen38$(EXE) --fixture ./qwen38_mm_tiny
 
-tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+tests/test_qwen38_native_weights$(EXE): tests/test_qwen38_native_weights.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h segment_runtime.c segment_runtime.h segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< segment_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
@@ -1508,7 +1508,7 @@ $(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h edge_runtime.h \
 		edge_adapter_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
 
-$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c qwen38_core.h segment_runtime.h \
+$(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c qwen38_core.h qwen38_matmul.h segment_runtime.h \
 		segment_adapters.h segment_adapter_internal.h edge_runtime.h \
 		edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h \
 		qwen38_nfc.h qwen38_nfc_tables.h route_trace.h tok_unicode.h \
@@ -1764,6 +1764,11 @@ tests/test_qwen38_tier$(EXE): tests/test_qwen38_tier.c tests/qwen38_fake_cuda.h 
 
 tests/test_qwen38_tier_fill_wait$(EXE): tests/test_qwen38_tier_fill_wait.c tests/qwen38_fake_cuda.h qwen38_tier.c qwen38_tier.h backend_cuda.h compat.h tier.h quant.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The vector weight matmuls are split out of qwen38_core.h precisely so this
+# can compile: a toy bank, no Model, no checkpoint.
+tests/test_qwen38_simd_matmul$(EXE): tests/test_qwen38_simd_matmul.c qwen38_matmul.h quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c tests/qwen36_fake_cuda.h qwen36.c qwen36_tier.c qwen36_tier.h backend_cuda.h cli_args.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
