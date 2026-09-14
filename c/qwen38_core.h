@@ -14,6 +14,10 @@
  * nothing, so the CPU path stays what it was before, line for line. */
 #include "qwen38_tier.h"
 
+/* Dense weight matmuls, in their own header so a test can drive them without
+ * a Model: q38_weight_matmul below is the only dispatcher. */
+#include "qwen38_matmul.h"
+
 #define Q38_MAX_LAYERS 512
 #define Q38_MAX_EXPERTS 1024
 #define Q38_MAX_TOPK 256
@@ -197,20 +201,6 @@ static float *falloc(int64_t n) {
     return p;
 }
 
-/* W is row-major [O,I], y=x@W^T. */
-static void q38_matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float a = 0.f;
-            for (int i = 0; i < I; i++) a += xs[i] * w[i];
-            y[(int64_t)s * O + o] = a;
-        }
-    }
-}
-
 static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
     if(weight->owns_data)free(weight->data);
@@ -254,20 +244,20 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
            (uint64_t)weight->scale_count*sizeof(float);
 }
 
-/* Native BF16 storage with FP32 activations and accumulation.  This deliberately
- * does not round activations to BF16 or use BF16 dot-product instructions: it is
- * the storage-equivalent form of the existing st_read_f32 reference. */
-static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
-                            int S,int I,int O) {
-    #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++){
-        const uint16_t *w=W+(int64_t)o*I;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I;float a=0.f;
-            for(int i=0;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
-            y[(int64_t)s*O+o]=a;
-        }
-    }
+/* The vector kernels in qwen38_matmul.h are a prefill lever worth 6-7x on the
+ * shapes this engine uses, and measurably more accurate than the reference,
+ * so they are the default.  Q38_SIMD_MATMUL=0 selects the reference path
+ * instead, which keeps both arms of an A/B measurement inside one binary. */
+static int q38_env_bool(const char *name,int default_value);
+
+static int q38_simd_matmul(void) {
+#ifdef __AVX2__
+    static int cached=-1;
+    if(cached<0)cached=q38_env_bool("Q38_SIMD_MATMUL",1);
+    return cached;
+#else
+    return 0;
+#endif
 }
 
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
@@ -277,13 +267,27 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                 weight?weight->rows:0,weight?weight->cols:0,
                 weight?(int)weight->kind:0,O,I);exit(1);
     }
-    if(weight->kind==Q38_WEIGHT_F32)
+    if(weight->kind==Q38_WEIGHT_F32){
         q38_matmul(y,x,(const float*)weight->data,S,I,O);
-    else if(weight->kind==Q38_WEIGHT_BF16)
+    }else if(weight->kind==Q38_WEIGHT_BF16){
+#ifdef __AVX2__
+        if(q38_simd_matmul()){
+            q38_matmul_bf16_avx2(y,x,(const uint16_t*)weight->data,S,I,O);
+            return;
+        }
+#endif
         q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
-    else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
+    }else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales){
+#ifdef __AVX2__
+        if(q38_simd_matmul()){
+            q38_matmul_fp8_avx2(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+            return;
+        }
+#endif
         matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
-    else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
+    }else{
+        fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);
+    }
 }
 
 static void q38_weight_row(const Q38Weight *weight,int row,float *out) {
