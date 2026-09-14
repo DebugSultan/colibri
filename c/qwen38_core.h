@@ -1521,17 +1521,59 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
+/* The chunk ceiling and the workspace budget used to be compile-time only.  An
+ * isolated prefill measurement (274 tokens, one forward) showed that the
+ * ceiling -- not the budget -- is what binds: 32 rows cut the prompt into nine
+ * chunks, each chunk touches ~91 distinct experts, so a loaded expert serves
+ * ~3.3 rows.  That drags 4.69 MiB of FP8 weights in for three rows of
+ * activations, which is decode-grade arithmetic intensity inside a path that is
+ * supposed to be batched, and it shows: 1.29 TFLOP in 48.8 s is 26.5 GFLOP/s,
+ * a few percent of what the cores can do.  Both values are therefore runtime
+ * knobs now.  Widening the chunk cannot change any result -- boundaries alter
+ * neither routing nor accumulation order -- so this is a pure A/B. */
+static int q38_env_positive_int(const char *name,int default_value,
+                                int max_value) {
+    const char *value=getenv(name);
+    if(!value||!*value)return default_value;
+    char *end=NULL;long parsed=strtol(value,&end,10);
+    if(end==value||*end||parsed<1||parsed>(long)max_value){
+        fprintf(stderr,"%s must be an integer in 1..%d\n",name,max_value);
+        exit(1);
+    }
+    return (int)parsed;
+}
+
+static int q38_prefill_batch_rows(void) {
+    static int cached=0;
+    if(!cached)
+        cached=q38_env_positive_int("Q38_PREFILL_BATCH_ROWS",
+                                    Q38_PREFILL_BATCH_ROWS,1<<20);
+    return cached;
+}
+
+/* Expressed in MiB because the byte count is the thing a human gets wrong. */
+static uint64_t q38_prefill_workspace_bytes(void) {
+    static uint64_t cached=0;
+    if(!cached)
+        cached=(uint64_t)q38_env_positive_int(
+                   "Q38_PREFILL_WORKSPACE_MIB",
+                   (int)(Q38_PREFILL_WORKSPACE_BYTES>>20),4096)<<20;
+    return cached;
+}
+
 /* Choose a context-independent prefill chunk whose private workspace fits the
  * common target.  Callers provide exact fixed and per-row byte counts; even a
  * hostile-but-valid geometry gets one row rather than an unbounded allocation. */
 static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
                                     uint64_t per_row) {
-    int rows=requested<Q38_PREFILL_BATCH_ROWS?requested:Q38_PREFILL_BATCH_ROWS;
+    int ceiling=q38_prefill_batch_rows();
+    uint64_t budget=q38_prefill_workspace_bytes();
+    int rows=requested<ceiling?requested:ceiling;
     if(rows<1)return 1;
     for(;rows>1;rows--)
         if(per_row<=UINT64_MAX/(uint64_t)rows&&
            fixed<=UINT64_MAX-per_row*(uint64_t)rows&&
-           fixed+per_row*(uint64_t)rows<=Q38_PREFILL_WORKSPACE_BYTES)
+           fixed+per_row*(uint64_t)rows<=budget)
             return rows;
     return 1;
 }
