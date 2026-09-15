@@ -1568,11 +1568,17 @@ typedef struct {
 static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                                 Slot **selected) {
     if(!m->expert_parallel_reads||!experts||!selected||count<2||
-       count>Q38_MAX_TOPK)return 0;
+       count>m->cache[layer].cap)return 0;
     LCache *cache=&m->cache[layer];
-    if(cache->cap<count||
-       (!m->int4_active&&!q38_prepare_expert_scale_bank(m,layer)))return 0;
-    Q38ExpertLoadJob jobs[Q38_MAX_TOPK];
+    if((!m->int4_active&&!q38_prepare_expert_scale_bank(m,layer)))return 0;
+    /* The demand set is no longer bounded by the decode top-k: the MoE prefill
+     * hands over the whole chunk union (up to the cache cap) so its loads run
+     * one OMP wave instead of serial groups of Q38_MAX_TOPK.  Load grouping
+     * never touches FP order: routed outputs are written per assignment and
+     * the per-position expert sum follows the router order, so a bigger wave
+     * only changes WHICH slots serve the reads, not the arithmetic. */
+    Q38ExpertLoadJob *jobs=malloc((size_t)count*sizeof(*jobs));
+    if(!jobs)return 0;
     for(int index=0;index<count;index++){
         int expert=experts[index];
         if(expert<0||expert>=m->c.experts)return 0;
@@ -1656,6 +1662,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
         }
     }
+    free(jobs);
     return 1;
 }
 
@@ -1963,6 +1970,10 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
     q38_dense_matmul(m,qp,x,&l->q,S,H,QH*2*D);q38_dense_matmul(m,kp,x,&l->k,S,H,KVH*D);q38_dense_matmul(m,vp,x,&l->v,S,H,KVH*D);
     q38_dense_matmul(m,ip,x,&l->idx_qk,S,H,(IQ+c->idx_kheads)*ID);
+    /* Cause before parallelism: the K/V/IK writes are disjoint per position
+     * (each s writes only its own row) and must be complete before the
+     * ranking, which reads the whole IK[0..pos] prefix. */
+    #pragma omp parallel for schedule(static)
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<KVH;h++){
@@ -1972,12 +1983,20 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
         memcpy(m->IK[layer]+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
-    float *heads=falloc((int64_t)S*QH*D),*qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
-    int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
-    if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
+    float *heads=falloc((int64_t)S*QH*D);
+    /* Ranking and attention are independent per position: no shared writes
+     * (heads is row-disjoint, the scratch is per-thread) and no FP order
+     * changes inside a position, so the result is bit-identical to the
+     * serial path. The scheduling is dynamic because the ranking cost grows
+     * with the position (the IK prefix to read is O(pos)). */
+    double qsa_started=now_s(),index_dt=0,attn_dt=0;
+    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt)
     for(int s=0;s<S;s++){
         int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
         double phase_started=now_s();
+        float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
+        int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
+        if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
         for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,c->theta);}
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
@@ -1990,7 +2009,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
         for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
-        q38_tm_add(m,Q38_TM_QSA_INDEX,phase_started); phase_started=now_s();
+        index_dt+=now_s()-phase_started; phase_started=now_s();
         for(int h=0;h<QH;h++){
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
             float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,c->theta);
@@ -2001,10 +2020,16 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=m->V[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
             for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
         }
-        q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
+        attn_dt+=now_s()-phase_started;
+        free(qidx);free(pool);free(selected);
+    }
+    #pragma omp critical
+    {
+        m->timers.seconds[Q38_TM_QSA_INDEX]+=index_dt;
+        m->timers.seconds[Q38_TM_QSA_ATTENTION]+=attn_dt;
     }
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
-    free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
+    free(qp);free(kp);free(vp);free(ip);free(heads);
 }
 
 /* The single-row path is intentionally kept separate from prefill.  Decode is
@@ -2229,7 +2254,6 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
          * loaded once for this chunk, and a later group may safely reuse its
          * slots because the preceding outputs already live in routed_out. */
         int load_limit=m->cache[layer].cap;
-        if(load_limit>Q38_MAX_TOPK)load_limit=Q38_MAX_TOPK;
         if(load_limit<1)load_limit=1;
         for(int unique_base=0;unique_base<unique_count;) {
             int load_count=unique_count-unique_base;
