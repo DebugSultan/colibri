@@ -160,6 +160,25 @@ int  q38t_plan_fill(int *layers, int *eids, int max);
 void q38t_cancel_plan(int layer, int eid);
 void q38t_fill_wait(void);
 
+/* Prefill: computes on the GPU the experts of `eids[0..count)` that are
+ * resident, synchronously. Unlike the decode issue/take pair this one has no
+ * row ceiling -- coli_cuda_expert_group() sizes its workspace dynamically --
+ * so it takes the whole chunk of a layer in a handful of calls.
+ *
+ * x and y are addressed through off[]: expert c reads rows[c] consecutive
+ * [hidden] rows starting at row off[c] of x and writes as many at row off[c]
+ * of y -- which is exactly the group layout q38_moe_prefill already builds,
+ * so no repacking happens on the engine side. done[] must come in zeroed:
+ * the function sets
+ * done[c]=1 for every expert it computed, and the caller keeps the others on
+ * the CPU. Returns how many experts were taken.
+ *
+ * Numerics: the GPU arm does not reproduce the CPU accumulation order, so a
+ * chunk computed here differs in the last bits from the same chunk computed
+ * on the CPU. Q38_TIER_PREFILL=0 turns it off for an A/B. */
+int q38t_expert_group(int layer, const int *eids, const int *rows, const int *off,
+                      int count, const float *x, float *y, uint8_t *done);
+
 /* A telemetry block on stderr: residency, hit/miss, uploads per device. */
 void q38t_stats(void);
 
@@ -173,6 +192,7 @@ static inline void q38t_note(int a,const int*b,int c){(void)a;(void)b;(void)c;}
 static inline void q38t_offer(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;}
 static inline uint32_t q38t_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline void q38t_take(uint32_t a,const float*b,int c,float*d){(void)a;(void)b;(void)c;(void)d;}
+static inline int q38t_expert_group(int a,const int*b,const int*c,const int*d,int e,const float*f,float*g,uint8_t*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 static inline int  q38t_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void q38t_cancel_plan(int a,int b){(void)a;(void)b;}
 static inline void q38t_fill_wait(void){}

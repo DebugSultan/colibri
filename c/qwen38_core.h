@@ -2127,6 +2127,15 @@ static int q38_moe_prefill_rows(const Cfg *c,int requested) {
  * only.  Expert outputs are placed back in assignment order and the final
  * weighted reduction still visits rank 0..top-k-1 for every row, preserving the
  * decode path's floating-point accumulation order. */
+/* A/B switch for the tier arm of the prefill. On by default: when the tier is
+ * up its experts are in VRAM anyway, and leaving them to the CPU is the very
+ * thing measured at 151 GFLOP/s. Q38_TIER_PREFILL=0 restores the CPU-only
+ * path, bit for bit. */
+static int q38_tier_prefill_enabled(void) {
+    const char *v=getenv("Q38_TIER_PREFILL");
+    return !v||!*v||atoi(v)!=0;
+}
+
 static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                             int S,float *out) {
     Cfg *c=&m->c;
@@ -2143,8 +2152,13 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     int *group_cursor=(int*)malloc((size_t)E*sizeof(*group_cursor));
     int *unique=(int*)malloc((size_t)E*sizeof(*unique));
     Slot **batch_slots=(Slot**)calloc((size_t)E,sizeof(*batch_slots));
+    /* Tier arm: one entry per distinct expert of the chunk. */
+    int *tier_rows=(int*)malloc((size_t)E*sizeof(*tier_rows));
+    int *tier_off=(int*)malloc((size_t)E*sizeof(*tier_off));
+    uint8_t *tier_done=(uint8_t*)malloc((size_t)E);
     if(!routes||!assignments||!assignment_positions||!group_counts||
-       !group_offsets||!group_cursor||!unique||!batch_slots){
+       !group_offsets||!group_cursor||!unique||!batch_slots||
+       !tier_rows||!tier_off||!tier_done){
         fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);
     }
 
@@ -2221,8 +2235,52 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
             assignment_positions[assignment]=position;
         }
 
+        /* The tier arm comes FIRST, before the prefetch advice: an expert
+         * already in VRAM must not cost a disk range at all. What it leaves
+         * behind is the non-resident remainder, and only that is prefetched,
+         * loaded and ground on the CPU by the wave loop below.
+         *
+         * The GPU group does not reproduce the CPU accumulation order, so the
+         * rows it computes differ in the last bits. The reduction order is
+         * untouched (routed_out keeps the group layout either way); what
+         * changes is the value of a routed row, which is why the d3 gate is
+         * judged on a band and not on identity. */
+        if(m->tier&&q38_tier_prefill_enabled()) {
+            memset(tier_done,0,(size_t)unique_count);
+            int resident=0;
+            for(int u=0;u<unique_count;u++) {
+                int e=unique[u];
+                tier_rows[u]=group_counts[e];
+                tier_off[u]=group_offsets[e];
+                if(!q38t_is_resident(layer,e))continue;
+                resident++;
+                /* Gather in place: expert_input is dimensioned for the whole
+                 * assignment set, so the group layout fits and the tier reads
+                 * each group where group_offsets already says it is. */
+                for(int a=0;a<group_counts[e];a++) {
+                    int assignment=assignments[group_offsets[e]+a];
+                    int row=assignment/K;
+                    memcpy(expert_input+(int64_t)(group_offsets[e]+a)*H,
+                           x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                }
+            }
+            if(resident) {
+                double tier_started=now_s();
+                int taken=q38t_expert_group(layer,unique,tier_rows,tier_off,
+                                            unique_count,expert_input,
+                                            routed_out,tier_done);
+                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,tier_started);
+                if(taken>0) {
+                    int kept=0;
+                    for(int u=0;u<unique_count;u++)
+                        if(!tier_done[u])unique[kept++]=unique[u];
+                    unique_count=kept;
+                }
+            }
+        }
+
         /* One advice range per distinct expert is enough for this chunk. */
-        q38_prefetch_native_fp8_experts(m,layer,unique,unique_count);
+        if(unique_count)q38_prefetch_native_fp8_experts(m,layer,unique,unique_count);
 
         /* Shared expert work is independent across rows and remains resident;
          * batching it here also keeps its cost out of the routed groups. */
@@ -2310,6 +2368,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     free(expert_up);free(routed_out);free(routes);free(assignments);
     free(assignment_positions);free(group_counts);free(group_offsets);
     free(group_cursor);free(unique);free(batch_slots);
+    free(tier_rows);free(tier_off);free(tier_done);
 }
 
 static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
