@@ -21,8 +21,10 @@
 #include "quant.h"            /* E4M3_LUT */
 
 #define Q38T_MAX_DEV  8
-/* VRAM reserve for the backend, measured: see the comment in q38t_init. */
-#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3.5 GiB */
+/* VRAM reserve for the backend. The default is the measured value -- see the
+ * comment at the budget in q38t_init; Q38T_DEV_RESERVE_MB (MiB) overrides it
+ * so the breaking point is measured stepwise instead of guessed. */
+#define Q38T_DEV_RESERVE ((size_t)3584*1024*1024)   /* 3.5 GiB default */
 #define Q38T_QCAP     16      /* staging ~4.7 MB/item -> ~75 MB ceiling */
 #define Q38T_MAX_ROWS 8       /* backend_cuda.cu:2091, "decode-scale only" */
 
@@ -106,6 +108,16 @@ static struct {
 
 static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
+
+/* Reserve in bytes: Q38T_DEV_RESERVE_MB (MiB), default Q38T_DEV_RESERVE.
+ * Read on every q38t_init -- once per process in production -- so tests can
+ * flip the env between inits without a reset hook. */
+static size_t dev_reserve(void){
+    const char *m=getenv("Q38T_DEV_RESERVE_MB");
+    double mb=(m && *m) ? atof(m) : 0.0;
+    if(mb>0) return (size_t)(mb*1024.0*1024.0);
+    return Q38T_DEV_RESERVE;
+}
 
 /* Local clock: the tier does not include qwen38_core.h and should not. In
  * nanoseconds because the individual calls sit in the microsecond range and a
@@ -364,9 +376,12 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * 128-token probe with a 1 GiB reserve: declared budget 14.2/14.3 GB,
      * two "[CUDA] tensor allocation: out of memory", and the uploader's
      * adaptive clamp settled at 11.9/12.0 GB -- the backend needed ~3.3 GB,
-     * not 1. Q38T_DEV_RESERVE is reserved and the clamp stays as a net: if
-     * the card fills up anyway the tier stops promoting instead of failing
-     * the run. */
+     * not 1. Q38T_DEV_RESERVE is the default and the clamp stays as a net:
+     * if the card fills up anyway the tier stops promoting instead of failing
+     * the run. Q38T_DEV_RESERVE_MB lowers it stepwise (3584 -> 2048 -> 1024,
+     * watching upload_fail) because in prefill the backend takes ~200 MB per
+     * card, and the reserve is worth ~1900 experts per GiB. */
+    size_t reserve=dev_reserve();
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
@@ -374,7 +389,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
          * upload fail until the uploader's clamp kicked in (#1411's lesson):
          * the ceiling is min(requested, measured headroom), and the banner
          * says so. */
-        size_t headroom = freeb>Q38T_DEV_RESERVE ? freeb-Q38T_DEV_RESERVE : 0;
+        size_t headroom = freeb>reserve ? freeb-reserve : 0;
         size_t b = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
                    : headroom;
@@ -385,8 +400,10 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
             b=headroom;
         }
         G.budget[i]=b;
-        fprintf(stderr,"[q38tier] dev %d: %.1f GB free, budget %.1f GB (~%zu experts)\n",
-                G.dev[i], freeb/1073741824.0, b/1073741824.0, b/G.exp_bytes);
+        fprintf(stderr,"[q38tier] dev %d: %.1f GB free, reserve %.2f GiB, "
+                       "budget %.1f GB (~%zu experts)\n",
+                G.dev[i], freeb/1073741824.0, reserve/1073741824.0,
+                b/1073741824.0, b/G.exp_bytes);
     }
     G.slot=calloc((size_t)nl*ne,sizeof(Q38TSlot));
     G.is_x_floats=(size_t)G.ndev*Q38T_MAX_ROWS*D;
