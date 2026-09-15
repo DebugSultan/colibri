@@ -86,6 +86,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_fp8_set_lut(const float *lut);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
         const void *weights, const float *scales,
         int fmt, int I, int O, int device, int gs);
+/* Arena upload: same result as the _g variant, but the storage is the
+ * CALLER's device memory (an expert-arena slot). The returned tensor owns
+ * nothing: tensor_free releases the descriptor and the accounting without
+ * cudaFree-ing weights or scales. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor,
+        const void *weights, const float *scales,
+        int fmt, int I, int O, int device, int gs,
+        void *dev_weights, float *dev_scales);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);

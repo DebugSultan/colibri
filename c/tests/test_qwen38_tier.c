@@ -1,5 +1,6 @@
 /* qwen38 tier invariants on the fake backend, no GPU: the accounting charges
- * at cudaMalloc granularity, the budget is min(requested, measured headroom),
+ * the exact payload (the arena stores experts with no rounding), the budget is
+ * min(requested, measured headroom) slot-aligned to the payload,
  * the planner's singular COLI_GPU selects a device, planned reservations are
  * released by q38t_cancel_plan, and the byte bookkeeping stays inside the
  * budget on one and on two devices. Ported from the qwen36 tier test family
@@ -48,7 +49,7 @@ int main(void) {
     setenv("COLI_CUDA", "1", 1);
     seed();
 
-    /* --- 1. accounting: the charge is the cudaMalloc footprint ----------- */
+    /* --- 1. accounting: the charge is the exact payload ------------------ */
     setenv("COLI_GPUS", "0", 1);
     unsetenv("CUDA_EXPERT_GB");
     fake_ndev = 1;
@@ -58,13 +59,9 @@ int main(void) {
         return 1;
     }
     size_t payload = 3u * (D * IH) + 3u * SC * sizeof(float);
-    size_t want_exp = 3u * dev_alloc_footprint((size_t)D * IH)
-                    + 3u * dev_alloc_footprint(SC * sizeof(float));
-    check(G.exp_bytes == want_exp, "exp_bytes is not the footprint sum");
-    check(G.exp_bytes > payload, "the footprint charge does not exceed the payload");
-    check(G.exp_bytes != payload + 4096, "exp_bytes still uses the old flat-slack formula");
-    check(G.budget[0] == fake_free_bytes - Q38T_DEV_RESERVE,
-          "an auto budget is not the measured headroom");
+    check(G.exp_bytes == payload, "the charge is not the exact payload");
+    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
+          "the arena budget is not slot-aligned to the headroom");
     q38t_shutdown();
 
     /* --- 2. an explicit budget is clamped to the headroom ---------------- */
@@ -73,7 +70,7 @@ int main(void) {
         printf("  FAIL: init with an over-large explicit budget\n");
         return 1;
     }
-    check(G.budget[0] == fake_free_bytes - Q38T_DEV_RESERVE,
+    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
           "an explicit budget above the headroom was not clamped to it");
     q38t_shutdown();
     setenv("CUDA_EXPERT_GB", "1", 1);
@@ -81,7 +78,8 @@ int main(void) {
         printf("  FAIL: init with an explicit budget below the headroom\n");
         return 1;
     }
-    check(G.budget[0] == (size_t)1 << 30, "an explicit budget under the headroom was not honoured");
+    check(G.budget[0] == ((size_t)1 << 30) / payload * payload,
+          "an explicit budget under the headroom was not honoured");
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
 
@@ -95,7 +93,7 @@ int main(void) {
         printf("  FAIL: init with a parametric reserve\n");
         return 1;
     }
-    check(G.budget[0] == fake_free_bytes - ((size_t)16 << 20),
+    check(G.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
           "Q38T_DEV_RESERVE_MB did not move the auto budget");
     q38t_shutdown();
 
@@ -104,7 +102,7 @@ int main(void) {
         printf("  FAIL: init with an explicit budget over a parametric reserve\n");
         return 1;
     }
-    check(G.budget[0] == fake_free_bytes - ((size_t)16 << 20),
+    check(G.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
           "the explicit budget was not clamped to the parametric headroom");
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
@@ -114,7 +112,7 @@ int main(void) {
         printf("  FAIL: init with a junk reserve override\n");
         return 1;
     }
-    check(G.budget[0] == fake_free_bytes - Q38T_DEV_RESERVE,
+    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
           "a junk Q38T_DEV_RESERVE_MB did not fall back to the default");
     q38t_shutdown();
     unsetenv("Q38T_DEV_RESERVE_MB");
@@ -179,6 +177,31 @@ int main(void) {
     pthread_mutex_unlock(&G.mx);
     check(resident_count(0) == n - 1, "the planned residents do not match the plan minus the cancellation");
     q38t_shutdown();
+
+    /* --- 4c. arena slots are recycled -------------------------------------
+     * CUDA_EXPERT_GB tuned so the arena holds exactly NE payload slots:
+     * a full plan, a full cancel, and a second full plan only succeeds if
+     * every cancelled reservation gave its slot back. One leaked slot and
+     * the second plan comes up short. */
+    setenv("CUDA_EXPERT_GB", "0.00005", 1);
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
+        printf("  FAIL: init with an arena sized to exactly NE slots\n");
+        return 1;
+    }
+    check(G.budget[0] >= (size_t)NE * G.exp_bytes && G.budget[0] < (size_t)(NE + 1) * G.exp_bytes,
+          "the tuned budget did not land on exactly NE arena slots");
+    int L1[NE], E1[NE];
+    int n1 = q38t_plan_fill(L1, E1, NE);
+    check(n1 == NE, "the first plan did not fill the arena");
+    for (int i = 0; i < n1; i++) q38t_cancel_plan(L1[i], E1[i]);
+    /* Direct on the free-list: plan_fill's cursor is single-shot, so a
+     * second plan cannot re-cover the ground -- the free count is the truth. */
+    check(G.slot_free_n[0] == (int)(G.budget[0] / G.exp_bytes),
+          "the cancelled slots were not given back to the arena");
+    check(G.used[0] == 0, "the cancelled charges were not released");
+    q38t_shutdown();
+    unsetenv("CUDA_EXPERT_GB");
+
     unsetenv("HEAT_FILE");
     remove(tmp_heat);
 
@@ -217,9 +240,8 @@ int main(void) {
         }
         check(G.fmt == 4 && G.gs == GS4, "the tier did not record fmt=4/gs");
         check(G.mat_bytes == (size_t)D * IH / 2, "int4 matrix bytes are not nibble-packed");
-        check(G.exp_bytes == 3u * dev_alloc_footprint((size_t)D * IH / 2)
-                           + 3u * dev_alloc_footprint(SC4 * sizeof(float)),
-              "int4 exp_bytes is not the nibble+scale footprint sum");
+        check(G.exp_bytes == 3u * ((size_t)D * IH / 2) + 3u * SC4 * sizeof(float),
+              "int4 exp_bytes is not the nibble+scale payload");
 
         int u4 = fake_uploads;
         last_fmt = -1; last_gs = -1; last_bytes = 0;
@@ -232,15 +254,6 @@ int main(void) {
         check(last_bytes == (size_t)D * IH / 2, "the backend was handed fp8-sized weights");
         check(resident_count(0) == NE, "not every int4 expert is resident");
         q38t_shutdown();
-
-        /* The VRAM saving is asserted at the production geometry, not at the
-         * toy one above: 64*32 bytes rounds to the same cudaMalloc granule
-         * whether it is halved or not, so the toy shapes cannot show it. */
-        {
-            size_t fp8_mat = (size_t)2560 * 640, i4_mat = fp8_mat / 2;
-            check(dev_alloc_footprint(i4_mat) * 2 == dev_alloc_footprint(fp8_mat),
-                  "halving the weight bytes did not halve the VRAM footprint at 2560x640");
-        }
 
         /* Refusals: the geometry is checked, not trusted. */
         check(!q38t_init(NL, NE, D, IH, TOPK, SC4, 1, 5, GS4),
