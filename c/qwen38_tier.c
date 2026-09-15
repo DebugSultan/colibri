@@ -94,6 +94,11 @@ static struct {
     int is_k[Q38T_MAX_DEV][Q38T_MAX_ROWS];
     float *is_x; size_t is_x_floats;
     int issue_open;                       /* no free while a group is in flight */
+    /* prefill state: staging for the synchronous grouped path. Separate from
+     * is_x because the two regimes never share a shape -- decode issues
+     * ndev*MAX_ROWS rows of D, prefill gathers a whole device batch. */
+    float *pf_x,*pf_y; size_t pf_floats;
+    uint64_t pf_calls,pf_batches,pf_experts,pf_rows,pf_refused,pf_absent,t_pf;
     /* warmstart */
     int *fill_order; int fill_n, fill_cur;
     uint32_t *heat0;
@@ -640,6 +645,121 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
     pthread_mutex_unlock(&G.mx);
 }
 
+/* --- prefill: synchronous grouped compute on the resident experts --------- */
+
+/* Default rows per batch. See the VRAM arithmetic in q38t_expert_group(). */
+#define Q38T_PREFILL_ROWS 4096
+
+/* Grows the two staging buffers to `floats` each. They are kept for the whole
+ * run: a prefill calls this 48 times per chunk and the steady size is reached
+ * on the first layer. */
+static int pf_reserve(size_t floats){
+    if(floats<=G.pf_floats) return 1;
+    float *nx=(float*)realloc(G.pf_x,floats*sizeof(float));
+    if(!nx) return 0;
+    G.pf_x=nx;
+    float *ny=(float*)realloc(G.pf_y,floats*sizeof(float));
+    if(!ny) return 0;                       /* pf_x kept: it is valid and larger */
+    G.pf_y=ny; G.pf_floats=floats;
+    return 1;
+}
+
+/* Runs one batch: `n` experts of the SAME device, indices bi[0..n) into the
+ * caller's arrays. Gathers their rows into pf_x, calls the synchronous group,
+ * scatters back into y. Returns the number of experts computed (0 = refused,
+ * the caller leaves them to the CPU). */
+static int pf_flush(int layer,const int *eids,const int *rows,const int *off,
+                    int *bi,int n,int brows,
+                    const float *x,float *y,uint8_t *done){
+    if(n<1||brows<1) return 0;
+    if(!pf_reserve((size_t)brows*G.D)){ G.pf_refused++; return 0; }
+
+    ColiCudaTensor *tg[64],*tu[64],*td[64];
+    int r[64];
+    /* The tensors are read under the lock and issue_open is raised before
+     * letting it go: from here until the flag drops the uploader cannot free
+     * a victim (uploader(), "swap: the victim is freed only when no group is
+     * in flight"). Same protocol as issue/take, synchronous instead of split. */
+    pthread_mutex_lock(&G.mx);
+    int c=0;
+    for(int j=0;j<n;j++){
+        Q38TSlot *s=qs(layer,eids[bi[j]]);
+        if(!s->resident||!s->tg||!s->tu||!s->td){ G.pf_absent++; continue; }
+        tg[c]=s->tg; tu[c]=s->tu; td[c]=s->td; r[c]=rows[bi[j]];
+        /* bi[] is reused below to scatter, so compact it the same way */
+        bi[c]=bi[j];
+        c++;
+    }
+    if(c) G.issue_open=1;
+    pthread_mutex_unlock(&G.mx);
+    if(!c) return 0;
+
+    int64_t gathered=0;
+    for(int j=0;j<c;j++){
+        memcpy(G.pf_x+gathered*G.D, x+(int64_t)off[bi[j]]*G.D,
+               (size_t)r[j]*G.D*sizeof(float));
+        gathered+=r[j];
+    }
+    uint64_t t0=now_ns();
+    int ok=coli_cuda_expert_group(tg,tu,td,r,c,G.pf_y,G.pf_x);
+    G.t_pf+=now_ns()-t0;
+
+    pthread_mutex_lock(&G.mx);
+    G.issue_open=0;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+
+    if(!ok){ G.pf_refused++; return 0; }
+    int64_t scattered=0;
+    for(int j=0;j<c;j++){
+        memcpy(y+(int64_t)off[bi[j]]*G.D, G.pf_y+scattered*G.D,
+               (size_t)r[j]*G.D*sizeof(float));
+        scattered+=r[j];
+        done[bi[j]]=1;
+    }
+    G.pf_batches++; G.pf_experts+=(uint64_t)c; G.pf_rows+=(uint64_t)gathered;
+    return c;
+}
+
+int q38t_expert_group(int layer,const int *eids,const int *rows,const int *off,
+                      int count,const float *x,float *y,uint8_t *done){
+    if(!G.on||!eids||!rows||!off||!x||!y||!done||count<1||layer<0||layer>=G.nl)
+        return 0;
+    int *bi=(int*)malloc((size_t)count*sizeof(*bi));
+    if(!bi) return 0;
+
+    /* Row budget of one batch. The ceiling that matters is VRAM: the backend
+     * reserves rows*(2*D+2*I) floats of workspace per call, ~25 KB per row
+     * with this geometry, so 4096 rows is ~105 MB on a card that is otherwise
+     * full of experts. It is a knob because the right value depends on what
+     * the budget left free, not on the model. */
+    int budget=Q38T_PREFILL_ROWS;
+    const char *env=getenv("Q38T_PREFILL_ROWS");
+    if(env&&*env){ int v=atoi(env); if(v>0) budget=v; }
+
+    int taken=0;
+    G.pf_calls++;
+    for(int di=0;di<G.ndev;di++){
+        int n=0,brows=0;
+        for(int c=0;c<count;c++){
+            if(rows[c]<1||done[c]) continue;
+            if(eids[c]<0||eids[c]>=G.ne||home(eids[c])!=di) continue;
+            if(!qs(layer,eids[c])->resident) continue;   /* rechecked under lock */
+            /* 64 experts is the backend's own ceiling (GroupDesc host[64],
+             * backend_cuda.cu:1850); the row budget is ours. An expert whose
+             * group alone exceeds the budget still goes through, on its own. */
+            if(n==64||(n>0&&brows+rows[c]>budget)){
+                taken+=pf_flush(layer,eids,rows,off,bi,n,brows,x,y,done);
+                n=0; brows=0;
+            }
+            bi[n++]=c; brows+=rows[c];
+        }
+        if(n) taken+=pf_flush(layer,eids,rows,off,bi,n,brows,x,y,done);
+    }
+    free(bi);
+    return taken;
+}
+
 /* --- warmstart ------------------------------------------------------------ */
 
 static const uint32_t *g_sort_heat;
@@ -743,6 +863,13 @@ void q38t_stats(void){
                 G.n_issue[i]? G.t_issue[i]/1000.0/G.n_issue[i] : 0.0,
                 (unsigned long long)G.n_take[i], G.t_take[i]/1e9,
                 G.n_take[i]? G.t_take[i]/1000.0/G.n_take[i] : 0.0);
+    if(G.pf_calls)
+        fprintf(stderr,"[q38tier] prefill: %llu calls, %llu batches, %llu experts,"
+                       " %llu rows, %.3f s on GPU | refused %llu, absent %llu\n",
+                (unsigned long long)G.pf_calls,(unsigned long long)G.pf_batches,
+                (unsigned long long)G.pf_experts,(unsigned long long)G.pf_rows,
+                G.t_pf/1e9,
+                (unsigned long long)G.pf_refused,(unsigned long long)G.pf_absent);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -788,7 +915,7 @@ void q38t_shutdown(void){
         if(s->td) coli_cuda_tensor_free(s->td);
         s->tg=s->tu=s->td=NULL; s->resident=0;
     }
-    free(G.slot); free(G.is_x); free(G.fill_order); free(G.heat0);
+    free(G.slot); free(G.is_x); free(G.pf_x); free(G.pf_y); G.pf_x=G.pf_y=NULL; G.pf_floats=0; free(G.fill_order); free(G.heat0);
     G.slot=NULL; G.is_x=NULL; G.fill_order=NULL; G.heat0=NULL;
     G.on=0;
 }
