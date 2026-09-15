@@ -182,6 +182,15 @@ int q38t_expert_group(int layer, const int *eids, const int *rows, const int *of
 /* A telemetry block on stderr: residency, hit/miss, uploads per device. */
 void q38t_stats(void);
 
+/* Host-RAM pinning hooks for total residency: the engine registers a
+ * lock/unlock pair and the tier fires them at the only two instants where
+ * an expert's host residency must flip -- unlock when the uploader finishes
+ * a promotion (the expert computes from VRAM; its host pages are dead
+ * weight), lock when a hot swap demotes a resident back to CPU fallback.
+ * The tier knows nothing about files or headers: resolution stays
+ * engine-side. Never registered = feature off, page-cache behavior. */
+void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int));
+
 #else /* !COLI_CUDA: stub inline, the engine stays CPU-only */
 
 static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g,int h,int i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
@@ -197,6 +206,7 @@ static inline int  q38t_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;ret
 static inline void q38t_cancel_plan(int a,int b){(void)a;(void)b;}
 static inline void q38t_fill_wait(void){}
 static inline void q38t_stats(void){}
+static inline void q38t_set_host_pin(void(*a)(int,int),void(*b)(int,int)){(void)a;(void)b;}
 
 #endif /* COLI_CUDA */
 #endif /* QWEN38_TIER_H */
