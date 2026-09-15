@@ -122,6 +122,19 @@ static struct {
 static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
 
+/* Host-RAM pinning hooks (residenza totale): the ENGINE owns the resolution
+ * (safetensors headers + mlock), the tier only owns the instants. Unlock
+ * fires when an upload completes (the expert computes from VRAM: its host
+ * pages are dead weight, and leaving them locked would grow the pinned set
+ * towards 64.8 GB of never-touched bytes); lock fires when a hot swap
+ * demotes a resident back to CPU fallback. Unregistered = no-op: the host
+ * side stays on page cache exactly as before. */
+static void (*g_pin_lock)(int,int);
+static void (*g_pin_unlock)(int,int);
+void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int)){
+    g_pin_lock=lock_fn; g_pin_unlock=unlock_fn;
+}
+
 /* Arena free-list. Every take and give happens under G.mx, in lockstep with
  * the budget charge it mirrors; the uploader reads only the arena_idx it
  * already owns. UINT32_MAX from arena_take means "no slot" -- the budget
@@ -237,6 +250,10 @@ static void *uploader(void *arg){
         G.inflight--;
         pthread_cond_broadcast(&G.cv_take);          /* this upload is complete */
         pthread_mutex_unlock(&G.mx);
+        /* Promotion complete: unpin the expert's host pages. Fired outside
+         * the mutex -- mlock/munlock can wait on I/O, the tier mutex never
+         * must. */
+        if(ok && g_pin_unlock) g_pin_unlock(layer,eid);
     }
 }
 
@@ -573,6 +590,7 @@ void q38t_offer(int layer,int eid,
                 const float *scales,int planned){
     if(!G.on||!gate||!up||!down||!scales) return;
     if(layer<0||layer>=G.nl||eid<0||eid>=G.ne) return;
+    long rel=-1;                              /* demoted victim awaiting relock */
     pthread_mutex_lock(&G.mx);
     G.offers++;
     Q38TSlot *s=qs(layer,eid);
@@ -652,15 +670,20 @@ void q38t_offer(int layer,int eid,
                                                     victim's slot; the uploader
                                                     frees the victim's tensors
                                                     before writing this slot */
+                rel=cold;                        /* back to CPU fallback: relock */
             }
             else v->resident=1;                  /* queue full: put it back */
         }
     }
+
     pthread_mutex_unlock(&G.mx);
 out:
+    /* The victim just lost its VRAM slot: its host ranges must go back to
+     * pinned, or a long session would slowly migrate the pinned set onto
+     * whatever the hot swaps promote. Outside the mutex (I/O, see above). */
+    if(rel>=0 && g_pin_lock) g_pin_lock((int)(rel/G.ne),(int)(rel%G.ne));
     return;
 }
-
 /* --- execution ------------------------------------------------------------ */
 
 uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){

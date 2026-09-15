@@ -1344,6 +1344,153 @@ static int q38_try_load_int4_expert(Model *m,int layer,int expert,Slot *slot) {
     return 1;
 }
 
+/* ---- Host-RAM pinning of the non-resident expert universe --------------
+ *
+ * While an expert still lives on SSD, no measurement of the engine is
+ * valid. Experts outside the VRAM tier are read by q38_load_int4_ranges
+ * straight into the persistent per-shard mappings of st_map_shard_range
+ * (COLI_MAP_EXPERTS=1): nailing those ranges down with mlock makes residency
+ * deterministic - the kernel does not evict them, drop_caches respects them,
+ * swap does not touch them - with no copies and without touching the hot
+ * path: the same pointers, only wired pages.
+ *
+ * The cost is the whole payload, 2.64 MiB per expert, and it only holds if
+ * the VRAM-resident experts are NOT pinned: the entire universe (24576 x
+ * 2.64 = 64.8 GiB) does not fit in RAM, while the ~13477 the warmstart
+ * leaves non-resident (34.5 GiB) does. So the initial pass runs only after a
+ * real warmstart (without HEAT_FILE there is no universe to cover), and the
+ * callback pair registered on the tier (q38t_set_host_pin) keeps the
+ * invariant locked <=> non-resident from then on: unlock on promotion
+ * (uploader thread), relock on demotion (swap victim in q38t_offer).
+ *
+ * MLOCK=0 or Q38_HOST_PIN=0 disable all of it; the default is ON. Every
+ * failed mlock is counted and not fatal: the part left unpinned stays on
+ * page cache, i.e. the status quo ante. */
+static long g_pin_wired;          /* bytes currently mlocked (atomic add/sub) */
+static long g_pin_failed;         /* mlock/munlock failures since start */
+static unsigned char *g_pin_map;  /* [layers*experts] per-expert locked flag */
+static Model *g_pin_model;        /* single-model engine, like the tier globals */
+
+static int q38_host_pin_on(void){
+    static int on=-1;
+    if(on<0){
+        on=1;
+        const char *e=getenv("Q38_HOST_PIN"); if(e && !atoi(e)) on=0;
+        const char *m=getenv("MLOCK");        if(m && !atoi(m)) on=0;
+    }
+    return on;
+}
+
+/* Portable wire/unwire: on POSIX it is mlock/munlock directly (sys/mman.h
+ * comes in from compat.h), on Windows the compat_* pair (VirtualLock),
+ * elsewhere a no-op. */
+#if defined(__APPLE__)||defined(__linux__)||defined(__FreeBSD__)
+#define q38_wire(a,l)   mlock((a),(l))
+#define q38_unwire(a,l) munlock((a),(l))
+#elif defined(_WIN32)
+#define q38_wire(a,l)   compat_mlock((a),(l))
+#define q38_unwire(a,l) compat_munlock((a),(l))
+#else
+#define q38_wire(a,l)   0
+#define q38_unwire(a,l) 0
+#endif
+
+/* lock=1: wire the expert's merged weight+scale; lock=0: release it. The
+ * addresses are deterministic (per-fd mappings that live as long as the
+ * process), so munlock lands on exactly the ranges mlock took. The
+ * per-expert flag avoids munlock on pages that were never locked (which the
+ * kernel accepts silently and which would skew the counter) and makes the
+ * callbacks idempotent: an mlock on an already locked range is a kernel
+ * no-op, never an error. */
+static void q38_host_pin_expert(int layer,int expert,int lock){
+    if(!g_pin_model||!g_pin_map) return;
+    size_t i=(size_t)layer*g_pin_model->c.experts+expert;
+    unsigned char *flag=&g_pin_map[i];
+    if(lock){
+        if(__atomic_load_n(flag,__ATOMIC_RELAXED)) return;
+        if(!g_pin_model->int4_active) return;
+        st_tensor *weight[2];
+        if(!q38_int4_expert_tensors(g_pin_model,layer,expert,weight)) return;
+        int ok=1;
+        for(int k=0;k<2&&ok;k++){
+            st_tensor *t=weight[k];
+            void *p=(void*)st_map_shard_range(t->fd,t->off,t->nbytes);
+            if(!p||q38_wire(p,(size_t)t->nbytes)!=0){
+                __atomic_fetch_add(&g_pin_failed,1,__ATOMIC_RELAXED); ok=0;
+            }else
+                __atomic_fetch_add(&g_pin_wired,(long)t->nbytes,__ATOMIC_RELAXED);
+        }
+        if(ok) __atomic_store_n(flag,(unsigned char)1,__ATOMIC_RELAXED);
+    }else{
+        int locked=__atomic_load_n(flag,__ATOMIC_RELAXED);
+        st_tensor *weight[2];
+        if(!q38_int4_expert_tensors(g_pin_model,layer,expert,weight)) return;
+        for(int k=0;k<2;k++){
+            st_tensor *t=weight[k];
+            if(locked){
+                void *p=(void*)st_map_shard_range(t->fd,t->off,t->nbytes);
+                if(p&&q38_unwire(p,(size_t)t->nbytes)==0)
+                    __atomic_fetch_sub(&g_pin_wired,(long)t->nbytes,__ATOMIC_RELAXED);
+                else
+                    __atomic_fetch_add(&g_pin_failed,1,__ATOMIC_RELAXED);
+            }
+            /* Dead cache is dropped here and not left to kswapd: after the
+             * warmstart ~29 GB of page cache belong to experts that are now
+             * resident in VRAM, and the pressure of evicting them slowly
+             * pushes cold anonymous memory into zram. DONTNEED on clean
+             * pages is free and does not touch the mapping: they refault
+             * from disk on the next access, but a promoted expert is no
+             * longer read from the host. */
+#ifndef _WIN32
+            if(t->fd>=0)
+                posix_fadvise(t->fd,(off_t)t->off,(off_t)t->nbytes,POSIX_FADV_DONTNEED);
+#endif
+        }
+        __atomic_store_n(flag,(unsigned char)0,__ATOMIC_RELAXED);
+    }
+}
+static void q38_pin_cb_lock(int l,int e){ q38_host_pin_expert(l,e,1); }
+static void q38_pin_cb_unlock(int l,int e){ q38_host_pin_expert(l,e,0); }
+
+/* Registration + the initial universe pass. After q38t_fill_wait the
+ * resident set is final, so every expert it left out is pinned once for
+ * all; from here on the callbacks keep the invariant. The callbacks are
+ * registered even without a warmstart so a session that fills by heat
+ * alone keeps its demoted experts covered once the pass eventually ran. */
+static void q38_host_pin_setup(Model *m,int warmstarted){
+    if(!m->tier||!q38_host_pin_on()) return;
+    g_pin_model=m;
+    q38t_set_host_pin(q38_pin_cb_lock,q38_pin_cb_unlock);
+    if(!warmstarted) return;
+    if(!m->int4_active){
+        fprintf(stderr,"[HOST-TIER] pinning skipped: only the int4-gs container is covered\n");
+        return;
+    }
+    if(!st_map_experts_enabled()){
+        fprintf(stderr,"[HOST-TIER] pinning skipped: COLI_MAP_EXPERTS=1 required "
+                       "(the reads fall back to pread, nothing to pin)\n");
+        return;
+    }
+    if(!g_pin_map){
+        g_pin_map=calloc((size_t)m->c.layers*m->c.experts,1);
+        if(!g_pin_map){ fprintf(stderr,"[HOST-TIER] OOM on the pin map — disabled\n"); return; }
+    }
+    double t0=now_s();
+    int experts=0;
+    long failed0=__atomic_load_n(&g_pin_failed,__ATOMIC_RELAXED);
+    for(int l=m->range_begin;l<m->range_end;l++)
+        for(int e=0;e<m->c.experts;e++){
+            if(q38t_is_resident(l,e)) continue;
+            q38_host_pin_expert(l,e,1);
+            if(g_pin_map[(size_t)l*m->c.experts+e]) experts++;
+        }
+    long w=__atomic_load_n(&g_pin_wired,__ATOMIC_RELAXED);
+    fprintf(stderr,"[HOST-TIER] mlock: %d experts (%.2f GB) wired in RAM in %.1f s%s\n",
+            experts,w/1073741824.0,now_s()-t0,
+            __atomic_load_n(&g_pin_failed,__ATOMIC_RELAXED)!=failed0
+              ?" — some ranges FAILED (memory): the residue stays on page cache":"");
+}
+
 static void q38_prefetch_native_fp8_experts(Model *m,int layer,
                                             const int *experts,int count) {
     if(!m->expert_prefetch||!experts||count<1)return;
@@ -1552,6 +1699,7 @@ static void q38_tier_warmstart(Model *m) {
     }
     if(total) fprintf(stderr,"[qwen38] tier warmstart: %d experts in %.1f s\n",
                       total,now_s()-t0);
+    q38_host_pin_setup(m,total>0);
 }
 
 typedef struct {
@@ -2510,7 +2658,14 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
-    if(m->tier){ q38t_stats(); q38t_shutdown(); m->tier=0; }
+    if(m->tier){
+        if(g_pin_map){
+            long w=__atomic_load_n(&g_pin_wired,__ATOMIC_RELAXED);
+            fprintf(stderr,"[HOST-TIER] final: %.2f GB locked, %ld lock/unlock failures\n",
+                    w/1073741824.0,__atomic_load_n(&g_pin_failed,__ATOMIC_RELAXED));
+        }
+        q38t_stats(); q38t_shutdown(); m->tier=0;
+    }
     for(int i=0;i<m->c.layers;i++) {
         if(m->L)q38_layer_free(&m->L[i]);
         if(m->cache) {
