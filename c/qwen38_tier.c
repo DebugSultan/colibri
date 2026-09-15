@@ -34,8 +34,13 @@ typedef struct {
 
 static struct {
     int on, nl, ne, D, Ih, topk, ndev;
+    /* Expert format as the backend numbers it: 8 = e4m3 with a scale per
+     * 128x128 block, 4 = int4 nibbles with a scale per group of gs along the
+     * input axis (gs is 0 when fmt is 8). Both are staged with the same three
+     * memcpy; only the byte counts and the upload argument change. */
+    int fmt, gs;
     size_t sc;                            /* scale float per matrix */
-    size_t mat_bytes;                     /* e4m3 bytes per matrix */
+    size_t mat_bytes;                     /* weight bytes per matrix */
     size_t exp_bytes;                     /* VRAM estimate per expert */
     int dev[Q38T_MAX_DEV];
     size_t budget[Q38T_MAX_DEV], used[Q38T_MAX_DEV];
@@ -55,6 +60,12 @@ static struct {
     /* statistics */
     uint64_t hits[Q38T_MAX_DEV], miss, uploads, upload_fail;
     uint64_t offers, promotions, swaps, q_full_skips, overflow_rows, take_fails;
+    /* Plans the engine gave back instead of offering. Cancelling is the
+     * legitimate answer for a plan it cannot execute (out-of-range layer,
+     * expert in a format the tier does not stage), so it is silent -- and
+     * that silence hid a mass cancellation that left the tier at 0 resident
+     * with every other counter also at 0. Counted, it cannot hide again. */
+    uint64_t plan_cancels;
     uint64_t tick;
     /* Hot-path stopwatches. These were added to settle one question -- is the
      * GPU branch latency-bound or bandwidth-bound? -- and the measured answer
@@ -101,9 +112,14 @@ static uint64_t now_ns(void){
 
 /* Staging. In qwen36 this function had to bring the two's-complement int4
  * nibbles back to biased binary; here the format in RAM IS already the
- * backend's (raw e4m3, a scale per 128x128 block), so it is three copies and
- * nothing else. The three matrices are NOT assumed contiguous: with
- * COLI_MAP_EXPERTS=1 the slot points at three distinct file mappings. */
+ * backend's -- raw e4m3 for fmt=8, and for fmt=4 the offset-binary nibbles
+ * the backend's own offset_to_signed_s4 kernel expects -- so it is three
+ * copies and nothing else. The three matrices are NOT assumed contiguous:
+ * with COLI_MAP_EXPERTS=1 the slot points at three distinct file mappings.
+ * The three scale blocks ARE assumed contiguous and of equal length: fmt=8
+ * bills each matrix fp8_nblk(D)*fp8_nblk(Ih) floats, and fmt=4 bills
+ * D*Ih/gs for all three because q38_int4_group_size only accepts a gs that
+ * divides both D and Ih. */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *gate, const uint8_t *up, const uint8_t *down,
                   const float *scales){
@@ -148,12 +164,14 @@ static void *uploader(void *arg){
         } else pthread_mutex_unlock(&G.mx);
 
         int dv=G.dev[home(eid)];
-        /* fmt=8: gate/up are [inter,hidden], down is [hidden,inter]; the
-         * signature wants (I=input, O=output), not (rows, columns). */
+        /* gate/up are [inter,hidden], down is [hidden,inter]; the signature
+         * wants (I=input, O=output), not (rows, columns). The _g variant is
+         * used for both formats: with gs=0 it is the plain upload, and fmt=4
+         * needs gs to derive ng=(I+gs-1)/gs and the scale count. */
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
-        int ok = coli_cuda_tensor_upload(&tg, w,                 sc,          8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&tu, w+G.mat_bytes,     sc+G.sc,     8, G.D,  G.Ih, dv)
-              && coli_cuda_tensor_upload(&td, w+2*G.mat_bytes,   sc+2*G.sc,   8, G.Ih, G.D,  dv);
+        int ok = coli_cuda_tensor_upload_g(&tg, w,               sc,        G.fmt, G.D,  G.Ih, dv, G.gs)
+              && coli_cuda_tensor_upload_g(&tu, w+G.mat_bytes,   sc+G.sc,   G.fmt, G.D,  G.Ih, dv, G.gs)
+              && coli_cuda_tensor_upload_g(&td, w+2*G.mat_bytes, sc+2*G.sc, G.fmt, G.Ih, G.D,  dv, G.gs);
         free(w); free(sc);
         pthread_mutex_lock(&G.mx);
         Q38TSlot *s=qs(layer,eid);
@@ -236,7 +254,7 @@ static size_t dev_alloc_footprint(size_t bytes){
 }
 
 int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
-              int native_fp8){
+              int native_fp8, int fmt, int gs){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
     if(G.on){
@@ -248,10 +266,33 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
                        "process -> CPU path for this one\n");
         return 0;
     }
-    if(!native_fp8){
+    if(fmt!=8&&fmt!=4){
+        fprintf(stderr,"[q38tier] expert format %d unsupported (8=fp8, 4=int4 "
+                       "grouped) -> CPU path\n",fmt);
+        return 0;
+    }
+    if(fmt==8&&!native_fp8){
         fprintf(stderr,"[q38tier] native FP8 disabled: the RAM slots hold expanded "
                        "F32, which no fmt=8 kernel reads -> CPU path\n");
         return 0;
+    }
+    if(fmt==4){
+        /* The group size has to divide both axes, or the three matrices do
+         * not bill the same number of scales and the single G.sc stride in
+         * stage() and in the uploader would be wrong. q38_int4_group_size
+         * already refuses anything else at load time; this is the tier's own
+         * check, because a tier that silently stages the wrong stride is the
+         * defect class that costs a whole window. */
+        if(gs<8||D%gs||Ih%gs||(size_t)scale_count!=(size_t)D*(size_t)Ih/(size_t)gs){
+            fprintf(stderr,"[q38tier] int4 geometry refused: gs=%d, D=%d, Ih=%d, "
+                           "scale_count=%d (expected %zu) -> CPU path\n",
+                    gs,D,Ih,scale_count,(size_t)D*(size_t)Ih/(gs>0?(size_t)gs:1));
+            return 0;
+        }
+        if((int64_t)D*Ih%2){
+            fprintf(stderr,"[q38tier] int4 needs an even D*Ih to pack -> CPU path\n");
+            return 0;
+        }
     }
     if(topk>Q38T_MAX_ROWS*Q38T_MAX_DEV){
         fprintf(stderr,"[q38tier] topk=%d unsupported\n",topk); return 0;
@@ -259,7 +300,8 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     if(nl<1||ne<1||D<1||Ih<1||scale_count<1) return 0;
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.sc=(size_t)scale_count;
-    G.mat_bytes=(size_t)D*(size_t)Ih;
+    G.fmt=fmt; G.gs=(fmt==4)?gs:0;
+    G.mat_bytes=(fmt==4) ? (size_t)D*(size_t)Ih/2 : (size_t)D*(size_t)Ih;
 
     /* Devices: COLI_GPUS="0,1" (default: first two visible devices).
      * COLI_GPU is the singular the planner writes for a one-device plan;
@@ -285,8 +327,11 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     if(G.ndev<1){ fprintf(stderr,"[q38tier] no CUDA devices -> CPU path\n"); return 0; }
 
     /* The e4m3 LUT must be published BEFORE any fmt=8 upload: without it,
-     * the backend refuses them instead of decoding against a table of zeros. */
-    if(!coli_cuda_fp8_set_lut(E4M3_LUT)){
+     * the backend refuses them instead of decoding against a table of zeros.
+     * fmt=4 never decodes e4m3, so a failure there is not fatal -- it is
+     * published anyway because the backend is process-wide and the cost is a
+     * 1 KiB copy. */
+    if(!coli_cuda_fp8_set_lut(E4M3_LUT) && G.fmt==8){
         fprintf(stderr,"[q38tier] coli_cuda_fp8_set_lut failed -> CPU path\n");
         return 0;
     }
@@ -296,7 +341,10 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB,
      * one above 512 KiB up to 1 MiB, and small ones to 8 KiB steps
      * (dev_alloc_footprint has the measured table).
-     * An expert is three weight allocations plus three scale allocations.
+     * An expert is three weight allocations plus three scale allocations,
+     * whichever the format: fmt=4 halves the weight side and multiplies the
+     * scale side by 128*128/gs, which for gs=64 is a net ~2x more experts
+     * resident per card.
      * Charged by payload, the fp8 qwen38 expert (3 x 1.56 MiB) looked like
      * 4.69 MiB and took 6.03 MiB: the budget over-committed by ~28 % and the
      * first "tensor allocation: out of memory" froze it permanently via the
@@ -365,8 +413,9 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     q38t_aff_restore(&aff);
     G.on=1;
     fprintf(stderr,"[q38tier] CUDA VRAM expert tier active: %d device(s), "
-                   "%.2f MB/expert, %d experts total\n",
-            G.ndev, G.exp_bytes/1048576.0, nl*ne);
+                   "fmt=%d%s, %.2f MB/expert, %d experts total\n",
+            G.ndev, G.fmt, G.fmt==4?" (int4 grouped)":" (fp8 e4m3)",
+            G.exp_bytes/1048576.0, nl*ne);
     return 1;
 }
 
@@ -638,6 +687,7 @@ void q38t_cancel_plan(int layer,int eid){
         int di=home(eid);
         if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
         s->planned=0;
+        G.plan_cancels++;
     }
     pthread_mutex_unlock(&G.mx);
 }
@@ -667,7 +717,8 @@ void q38t_stats(void){
     }
     fprintf(stderr,"\n[q38tier] gpu %llu, cpu %llu (%.1f%% on GPU) | offers %llu,"
                    " promotions %llu, swaps %llu, uploads %llu, failed %llu,"
-                   " queue-full %llu, row-overflow %llu, take-fail %llu\n",
+                   " queue-full %llu, row-overflow %llu, take-fail %llu,"
+                   " plan-cancels %llu\n",
             (unsigned long long)hit,(unsigned long long)G.miss,
             (hit+G.miss)? 100.0*hit/(double)(hit+G.miss) : 0.0,
             (unsigned long long)G.offers,(unsigned long long)G.promotions,
@@ -675,7 +726,8 @@ void q38t_stats(void){
             (unsigned long long)G.upload_fail,
             (unsigned long long)G.q_full_skips,
             (unsigned long long)G.overflow_rows,
-            (unsigned long long)G.take_fails);
+            (unsigned long long)G.take_fails,
+            (unsigned long long)G.plan_cancels);
     /* Vedi il commento sui cronometri nella struttura G per come si leggono,
      * e in particolare perche' t_take di dev1 e' un eccesso e non un assoluto. */
     uint64_t t_is=0,t_tk=0;

@@ -46,7 +46,7 @@ int main(void) {
     fake_free_bytes = 8ull << 30;   /* above Q38T_DEV_RESERVE, or the budget is 0 */
     fake_upload_hook = slow_upload;
 
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1 /* native_fp8 */)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1 /* native_fp8 */, 8 /* fmt */, 0 /* gs */)) {
         printf("  FAIL: the tier should start on the fake backend\n");
         return 1;
     }

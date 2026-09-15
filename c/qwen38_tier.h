@@ -31,6 +31,12 @@
  *     holds for hot promotions -- it offers what it just loaded for a miss,
  *     which is exactly the moment the bytes are in hand.
  *
+ * Since the int4 gs64 container landed the tier stages that too (fmt=4,
+ * per-group scales): same three memcpy, half the weight bytes, and the
+ * misses that remain read int4 from disk instead of fp8. The paragraph
+ * below describes the fp8 arm, which is still the default when
+ * Q38_INT4_SNAP is unset.
+ *
  * In exchange the format is a gift: qwen38 is native FP8 and with
  * native_fp8 on the slot already holds raw e4m3 with a scale per 128x128
  * block (q38_load_native_fp8_ranges), i.e. **exactly** the fmt=8 that
@@ -79,11 +85,18 @@
  * a different shape than the other. Refuses (returns 0, the engine stays on
  * CPU) if native_fp8 is off: without native FP8 the slot holds expanded F32,
  * four times larger and in a format the fmt=8 kernels do not read.
- * scale_count is fp8_nblk(hidden)*fp8_nblk(inter), i.e. how many float the
- * scales of ONE of the three matrices are worth -- the engine already
- * computed it for its per-layer scale bank. */
+ * scale_count is how many float the scales of ONE of the three matrices are
+ * worth: fp8_nblk(hidden)*fp8_nblk(inter) for fmt=8 -- the engine already
+ * computed it for its per-layer scale bank -- and hidden*inter/gs for fmt=4,
+ * where it is the same for all three because gs divides both axes.
+ *
+ * fmt is the backend's format number of the experts the engine will offer:
+ * 8 for native e4m3, 4 for the int4 gs-grouped container (Q38_INT4_SNAP),
+ * and gs is the group size, ignored unless fmt is 4. The tier stages ONE
+ * format: the engine must not offer it fp8 experts while it is in int4 mode,
+ * which is why the offer sites test the slot's kind. */
 int  q38t_init(int n_layers, int n_experts, int hidden, int inter, int topk,
-               int scale_count, int native_fp8);
+               int scale_count, int native_fp8, int fmt, int gs);
 int  q38t_ready(void);
 int  q38t_is_resident(int layer, int eid);
 void q38t_shutdown(void);
@@ -152,7 +165,7 @@ void q38t_stats(void);
 
 #else /* !COLI_CUDA: stub inline, the engine stays CPU-only */
 
-static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g,int h,int i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
 static inline int  q38t_ready(void){return 0;}
 static inline int  q38t_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void q38t_shutdown(void){}

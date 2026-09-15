@@ -32,6 +32,7 @@ struct ColiCudaTensor { int fmt, I, O, device, gs; const void *w; };
 
 static int fake_uploads;
 static int last_fmt = -1;
+static int last_gs = -1;
 static size_t last_bytes;
 static unsigned char captured[4096];
 static size_t captured_len;
@@ -48,7 +49,8 @@ static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
     *t = n;
     fake_uploads++;
     last_fmt = fmt;
-    last_bytes = (size_t)I * O;
+    last_gs = gs;
+    last_bytes = (fmt == 4) ? (size_t)I * O / 2 : (size_t)I * O;
     if (fake_uploads == 1) {
         captured_len = last_bytes < sizeof captured ? last_bytes : sizeof captured;
         memcpy(captured, w, captured_len);
@@ -58,6 +60,13 @@ static int upload_common(ColiCudaTensor **t, const void *w, int fmt,
 int coli_cuda_tensor_upload(ColiCudaTensor **t, const void *w, const float *s,
                             int fmt, int I, int O, int device) {
     (void)s; return upload_common(t, w, fmt, I, O, device, 0);
+}
+/* Grouped upload: same contract plus the int4 group size. The tier calls only
+ * this one, so a test can read back last_gs and catch a tier that stages int4
+ * nibbles while telling the backend they are per-row quantised (gs would be 0). */
+int coli_cuda_tensor_upload_g(ColiCudaTensor **t, const void *w, const float *s,
+                              int fmt, int I, int O, int device, int gs) {
+    (void)s; return upload_common(t, w, fmt, I, O, device, gs);
 }
 void coli_cuda_tensor_free(ColiCudaTensor *t) { free(t); }
 int coli_cuda_available_device_count(void) { return fake_ndev; }

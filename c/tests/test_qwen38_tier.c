@@ -20,9 +20,13 @@ static void check(int ok, const char *what) {
 }
 
 enum { NL = 1, NE = 8, D = 64, IH = 32, TOPK = 2, SC = 2 };
+/* The int4 arm: gs has to divide both axes, and scale_count is derived from
+ * the geometry (D*IH/gs), never declared -- q38t_init refuses a mismatch. */
+enum { GS4 = 8, SC4 = D * IH / GS4 };
 
 static unsigned char g[NE][D * IH], u[NE][D * IH], d[NE][D * IH];
 static float sc[NE][3 * SC];
+static float sc4[NE][3 * SC4];
 
 static void seed(void) {
     for (int eid = 0; eid < NE; eid++) {
@@ -30,6 +34,7 @@ static void seed(void) {
         memset(u[eid], (unsigned char)(eid + 2), sizeof u[eid]);
         memset(d[eid], (unsigned char)(eid + 3), sizeof d[eid]);
         for (int i = 0; i < 3 * SC; i++) sc[eid][i] = 1.0f;
+        for (int i = 0; i < 3 * SC4; i++) sc4[eid][i] = 1.0f;
     }
 }
 
@@ -48,7 +53,7 @@ int main(void) {
     unsetenv("CUDA_EXPERT_GB");
     fake_ndev = 1;
     fake_free_bytes = 8ull << 30;
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: the tier should start on the fake backend\n");
         return 1;
     }
@@ -64,7 +69,7 @@ int main(void) {
 
     /* --- 2. an explicit budget is clamped to the headroom ---------------- */
     setenv("CUDA_EXPERT_GB", "100", 1);
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init with an over-large explicit budget\n");
         return 1;
     }
@@ -72,7 +77,7 @@ int main(void) {
           "an explicit budget above the headroom was not clamped to it");
     q38t_shutdown();
     setenv("CUDA_EXPERT_GB", "1", 1);
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init with an explicit budget below the headroom\n");
         return 1;
     }
@@ -83,7 +88,7 @@ int main(void) {
     /* --- 3. COLI_GPU, the planner's singular, selects a device ----------- */
     unsetenv("COLI_GPUS");
     setenv("COLI_GPU", "0", 1);
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init with the singular COLI_GPU\n");
         return 1;
     }
@@ -93,7 +98,7 @@ int main(void) {
     unsetenv("COLI_GPU");
 
     /* --- 4. workload: bytes stay inside the budget, plans can be cancelled */
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init before the workload section\n");
         return 1;
     }
@@ -122,7 +127,7 @@ int main(void) {
     fwrite(heat, 4, NE, f);
     fclose(f);
     setenv("HEAT_FILE", tmp_heat, 1);
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init before the plan section\n");
         return 1;
     }
@@ -146,7 +151,7 @@ int main(void) {
     /* --- 5. two devices: the home split halves the bookkeeping ----------- */
     fake_ndev = 2;
     setenv("COLI_GPUS", "0,1", 1);
-    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1)) {
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
         printf("  FAIL: init on two fake devices\n");
         return 1;
     }
@@ -160,6 +165,57 @@ int main(void) {
     q38t_shutdown();
     fake_ndev = 1;
     setenv("COLI_GPUS", "0", 1);
+
+    /* --- 6. the int4 arm: half the weight bytes, and gs reaches the backend
+     * ---------------------------------------------------------------------
+     * A tier staging int4 while telling the backend fmt=8 would read the
+     * nibbles as e4m3 bytes and produce plausible-looking garbage, so the
+     * assertions below are on what the uploader actually handed over: the
+     * format, the group size, and the byte count (nibble-packed, so half).
+     * The fp8 exp_bytes measured in section 1 is the number to beat -- the
+     * whole point of the arm is more resident experts per GB. */
+    {
+        /* native_fp8 = 0: an int4 container does not need the FP8 path at all,
+         * and the tier used to refuse to start without it. */
+        if (!q38t_init(NL, NE, D, IH, TOPK, SC4, 0, 4, GS4)) {
+            printf("  FAIL: the int4 tier should start without native fp8\n");
+            return 1;
+        }
+        check(G.fmt == 4 && G.gs == GS4, "the tier did not record fmt=4/gs");
+        check(G.mat_bytes == (size_t)D * IH / 2, "int4 matrix bytes are not nibble-packed");
+        check(G.exp_bytes == 3u * dev_alloc_footprint((size_t)D * IH / 2)
+                           + 3u * dev_alloc_footprint(SC4 * sizeof(float)),
+              "int4 exp_bytes is not the nibble+scale footprint sum");
+
+        int u4 = fake_uploads;
+        last_fmt = -1; last_gs = -1; last_bytes = 0;
+        for (int eid = 0; eid < NE; eid++)
+            q38t_offer(0, eid, g[eid], u[eid], d[eid], sc4[eid], 0);
+        q38t_fill_wait();
+        check(fake_uploads - u4 == 3 * NE, "the int4 uploads did not all complete");
+        check(last_fmt == 4, "the uploader announced the wrong format to the backend");
+        check(last_gs == GS4, "the group size never reached the backend (per-row int4 instead)");
+        check(last_bytes == (size_t)D * IH / 2, "the backend was handed fp8-sized weights");
+        check(resident_count(0) == NE, "not every int4 expert is resident");
+        q38t_shutdown();
+
+        /* The VRAM saving is asserted at the production geometry, not at the
+         * toy one above: 64*32 bytes rounds to the same cudaMalloc granule
+         * whether it is halved or not, so the toy shapes cannot show it. */
+        {
+            size_t fp8_mat = (size_t)2560 * 640, i4_mat = fp8_mat / 2;
+            check(dev_alloc_footprint(i4_mat) * 2 == dev_alloc_footprint(fp8_mat),
+                  "halving the weight bytes did not halve the VRAM footprint at 2560x640");
+        }
+
+        /* Refusals: the geometry is checked, not trusted. */
+        check(!q38t_init(NL, NE, D, IH, TOPK, SC4, 1, 5, GS4),
+              "an unknown format was accepted");
+        check(!q38t_init(NL, NE, D, IH, TOPK, SC4, 1, 4, 7),
+              "a group size that divides neither axis was accepted");
+        check(!q38t_init(NL, NE, D, IH, TOPK, SC4 + 1, 1, 4, GS4),
+              "a scale count inconsistent with D*IH/gs was accepted");
+    }
 
     if (fails) { printf("test_qwen38_tier: %d failures\n", fails); return 1; }
     printf("test_qwen38_tier: ok\n");
