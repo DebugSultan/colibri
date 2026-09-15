@@ -112,6 +112,7 @@ static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
+static uint64_t g_tc_w4a16_rows;   /* rows served by the TC_W4A16 branch (routing oracle) */
 static uint64_t g_device_group_calls[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_experts[COLI_CUDA_MAX_DEVICES];
 static uint64_t g_device_group_rows[COLI_CUDA_MAX_DEVICES];
@@ -631,22 +632,27 @@ __global__ static void silu_mul(float *gate, const float *up, size_t n) {
 /* Four warps share one A tile and compute 16x64 outputs.  This matters for
  * prefill: the first prototype reloaded/converter A once per 16 output cols. */
 __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
-                                    const float *scale,int M,int K,int N){
+                                    const float *scale,int M,int K,int N,int gs){
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
     int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
     __shared__ __half ah[256],bh[4][256];
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
     size_t rb=(size_t)(K+1)/2;
+    /* gs>0: grouped-int4 scales [N,ng] (fmt=4, #334); gs==0: per-row scales
+     * [N] (fmt=2). The same index form covers both: gn*1+0 == gn. Folding the
+     * group scale into the fp16 B value is exact linearity (s_g * dot_g(x,w)
+     * == dot_g(x,w*s_g)) and matches the per-row kernel's semantics; a 16-wide
+     * k tile never straddles a group because the dispatcher gates gs%16==0. */
+    int ng=gs>0?(K+gs-1)/gs:1;
     for(int k0=0;k0<K;k0+=16){
-        for(int z=threadIdx.x;z<256;z+=blockDim.x){
-            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
-            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
-        }
+        int goff=gs>0?k0/gs:0;
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
         for(int z=lane;z<256;z+=32){
             int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
             if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
-                v=(float)(a&8?a-16:a)*scale[gn];}
+                v=(float)(a&8?a-16:a)*scale[(size_t)gn*ng+goff];}
             bh[warp][z]=__float2half(v);           /* [Ntile,Ktile] == B col-major */
         }
         __syncthreads();
@@ -665,19 +671,23 @@ __global__ static void w4a16_matmul(float *y,const float *x,const uint8_t *w,
  * while sharing the FP32->FP16 conversion of A. */
 __global__ static void w4a16_gate_up(float *gate,float *up,const float *x,
         const uint8_t *gw,const uint8_t *uw,const float *gs,const float *us,
-        int M,int K,int N){
+        int M,int K,int N,int ggrp,int ugrp){
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
     int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;const uint8_t *w=which?uw:gw;
     const float *scale=which?us:gs;float *y=which?up:gate;size_t rb=(size_t)(K+1)/2;
+    /* ggrp/ugrp: per-matrix int4 group size, 0 = per-row scales — see
+     * w4a16_matmul for the shared-indexing and linearity argument. */
+    int mgrp=which?ugrp:ggrp,ng=mgrp>0?(K+mgrp-1)/mgrp:1;
     __shared__ __half ah[256],bh[8][256];
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
     for(int k0=0;k0<K;k0+=16){
+        int goff=mgrp>0?k0/mgrp:0;
         for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
             ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
         for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
             if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
-                v=(float)(a&8?a-16:a)*scale[gn];}bh[warp][z]=__float2half(v);}
+                v=(float)(a&8?a-16:a)*scale[(size_t)gn*ng+goff];}bh[warp][z]=__float2half(v);}
         __syncthreads();
         wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
         wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
@@ -1362,6 +1372,12 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+/* Activation rows that went through the W4A16 Tensor Core branch. The tier's
+ * own counters say how many rows the grouped path SERVED; this one says how
+ * many of them took the TC route — without it an env flag could silently not
+ * engage and every downstream number would be fiction. */
+extern "C" void coli_cuda_tc_w4a16_rows(uint64_t *rows){ if(rows) *rows=g_tc_w4a16_rows; }
+
 extern "C" void coli_cuda_group_stats_device(
     int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
     double *h2d_ms, double *kernel_ms, double *d2h_ms) {
@@ -1840,9 +1856,9 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
     dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
     w4a16_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,
-        (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I);
+        (const uint8_t*)gate->weights,(const uint8_t*)up->weights,gate->scales,up->scales,S,D,I,0,0);
     silu_mul<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I);
-    w4a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D);
+    w4a16_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,(const uint8_t*)down->weights,down->scales,S,I,D,0);
     if(!cuda_ok(cudaGetLastError(),"shared w4a16 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "shared w4a16 output download")||
@@ -1894,7 +1910,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1;
+    int all_s4=1,all_q4=1,any_g4=0,any_e8=0,all_e8=1,any_f8=0,all_f8=1,all_q4tc=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -1903,6 +1919,11 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
                  g->gs,u->gs,d->gs};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        /* TC_W4A16 admissibility: fmt=2 rides as per-row (gs must be 0), fmt=4
+         * needs a group size that keeps one 16-wide k tile inside one group. */
+        all_q4tc&=((g->fmt==2&&g->gs==0)||(g->fmt==4&&g->gs>0&&g->gs%16==0))&&
+                  ((u->fmt==2&&u->gs==0)||(u->fmt==4&&u->gs>0&&u->gs%16==0))&&
+                  ((d->fmt==2&&d->gs==0)||(d->fmt==4&&d->gs>0&&d->gs%16==0));
         all_q4&=(g->fmt==2||g->fmt==4)&&(u->fmt==2||u->fmt==4)&&(d->fmt==2||d->fmt==4)&&
                 !(g->gs&1)&&!(u->gs&1)&&!(d->gs&1);   /* even gs: a packed byte never straddles groups */
         any_g4|=g->fmt==4||u->fmt==4||d->fmt==4;
@@ -1975,8 +1996,8 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
-    }else if(!pin_small_batch&&all_s4&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
-             atoi(getenv("COLI_CUDA_TC_W4A16"))&&
+    }else if(!pin_small_batch&&COLI_GPU_HAS_WMMA&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
+             atoi(getenv("COLI_CUDA_TC_W4A16"))&&all_q4&&all_q4tc&&
              [&]{ int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
                   for(int c=0;c<count;c++) if(rows[c]>=tc16_min) return 1;
                   return 0; }()){
@@ -1987,9 +2008,12 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
          * per token came from decode riding this branch's per-expert fallback). */
         /* W4A16 Tensor Core per group: fp16 activations per tile (lossless,
          * unlike the W4A4 path), one launch per expert inside the stream —
-         * the launch overhead is negligible next to the GEMMs. */
+         * the launch overhead is negligible next to the GEMMs. Was all_s4
+         * (per-row scales) only; all_q4&&all_q4tc admits fmt=4 members with a
+         * 16-divisible group size — the VRAM expert tiers' int4-gs64 uploads —
+         * while fmt=2 keeps riding as gs=0. */
         int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
-        int off16=0;
+        int off16=0,tc_rows=0;
         for(int c=0;c<count;c++){
             int r=rows[c];
             float *g16=ctx->gate+(size_t)off16*I,*u16=ctx->up+(size_t)off16*I;
@@ -1998,23 +2022,33 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
                 dim3 hg16((unsigned)((I+63)/64),(unsigned)((r+15)/16));
                 dim3 og16((unsigned)((D+63)/64),(unsigned)((r+15)/16));
                 w4a16_gate_up<<<hg16,256,0,ctx->stream>>>(g16,u16,x16,
-                    (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I);
+                    (const uint8_t*)host[c].g,(const uint8_t*)host[c].u,host[c].gs,host[c].us,r,D,I,
+                    host[c].ggs,host[c].ugs);
                 silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
                 w4a16_matmul<<<og16,128,0,ctx->stream>>>(y16,g16,
-                    (const uint8_t*)host[c].d,host[c].ds,r,I,D);
+                    (const uint8_t*)host[c].d,host[c].ds,r,I,D,host[c].dgs);
+                tc_rows+=r;
             }else{
-                /* piccoli batch: tile TC quasi vuoti + overhead di lancio — il
-                 * kernel naive per-elemento resta piu' veloce (misurato in decode) */
+                /* Small batches: the TC tiles come out nearly empty and the
+                 * launch overhead dominates, so the naive per-element kernel
+                 * is the faster of the two in decode.
+                 * gs/ng must match the tensor's real scale geometry: gs=0,ng=1 is
+                 * per-row (fmt=2) and silently mis-scales a fmt=4 member (#334). */
+                int gng=host[c].ggs?(D+host[c].ggs-1)/host[c].ggs:1;
+                int ung=host[c].ugs?(D+host[c].ugs-1)/host[c].ugs:1;
+                int dng=host[c].dgs?(I+host[c].dgs-1)/host[c].dgs:1;
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
-                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),0,1);
+                    host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D),host[c].ggs,gng);
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
-                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),0,1);
+                    host[c].u,host[c].us,host[c].uf,r,D,I,row_bytes(host[c].uf,D),host[c].ugs,ung);
                 silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(g16,u16,(size_t)r*I);
                 quant_matmul<<<dim3((unsigned)D,(unsigned)r),256,0,ctx->stream>>>(y16,g16,
-                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),0,1);
+                    host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I),host[c].dgs,dng);
             }
             off16+=r;
         }
+        if(tc_rows){ std::lock_guard<std::mutex> lock(g_group_stats_mu);
+                     g_tc_w4a16_rows+=(uint64_t)tc_rows; }
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));

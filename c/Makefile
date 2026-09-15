@@ -895,7 +895,7 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_grouped_g4_cuda.cu tests/test_w4a16_g4_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
@@ -938,6 +938,19 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# the test file is compiled.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
 	./weights_owned_test$(EXE)
+	# Grouped-int4 (fmt=4) dual kernels against the CPU oracle (#334): gs=64,
+	# tail groups, and a fmt=2 member riding the same launch; then the public
+	# API (sync vs async issue/take, bit-identical). Was manual-only since it
+	# landed, which is how oracles rot.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_grouped_g4_cuda.cu -o grouped_g4_test$(EXE)
+	./grouped_g4_test$(EXE)
+	# W4A16 Tensor Core branch over grouped-int4 scales: the VRAM expert
+	# tiers' fmt=4 uploads must actually ENGAGE the TC branch (the branch's
+	# own row counter is the routing oracle) and match the same CPU oracle
+	# within fp16 noise. Includes backend_cuda.cu itself, so only the test
+	# file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_w4a16_g4_cuda.cu -o w4a16_g4_test$(EXE)
+	./w4a16_g4_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.

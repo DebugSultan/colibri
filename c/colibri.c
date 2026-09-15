@@ -758,6 +758,10 @@ static void cuda_stats_print(void){
         "(%.2f expert/call)%s\n",(unsigned long long)calls,(unsigned long long)experts,
         (unsigned long long)rows,(double)experts/calls,
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
+    if(calls){ uint64_t tcrows=0; coli_cuda_tc_w4a16_rows(&tcrows);
+        if(tcrows) fprintf(stderr,"[CUDA] TC_W4A16 rows: %llu/%llu (%.1f%%)\n",
+            (unsigned long long)tcrows,(unsigned long long)rows,
+            rows?100.0*(double)tcrows/(double)rows:0.0); }
     if(calls&&g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         uint64_t dc=0,de=0,dr=0;
         coli_cuda_group_stats_device(g_cuda_devices[i],&dc,&de,&dr,NULL,NULL,NULL);
