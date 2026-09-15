@@ -67,7 +67,8 @@ typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *to
 typedef int            (*fn_device_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
-                                         double *h2d_ms, double *kernel_ms, double *d2h_ms);
+                           double *h2d_ms, double *kernel_ms, double *d2h_ms);
+typedef void           (*fn_tc_w4a16_rows)(uint64_t *rows);
 typedef void           (*fn_group_stats_device)(int device, uint64_t *calls,
                                                 uint64_t *experts, uint64_t *rows,
                                                 double *h2d_ms, double *kernel_ms,
@@ -166,6 +167,7 @@ static struct {
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_group_stats_device group_stats_device;
+    fn_tc_w4a16_rows   tc_w4a16_rows;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
     fn_expert_group_pinned expert_group_pinned;
@@ -1414,6 +1416,9 @@ static int coli_cuda_load(void){
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(group_stats_device, fn_group_stats_device)
+    /* Optional: the TC-rows counter arrived with the fmt=4 W4A16 branch; a DLL
+     * predating it leaves the pointer NULL and the wrapper reports 0 rows. */
+    RESOLVE_OPT(tc_w4a16_rows, fn_tc_w4a16_rows)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE_OPT(expert_group_pinned, fn_expert_group_pinned)
@@ -1544,6 +1549,12 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
         return;
     }
     g_cuda.group_stats(calls, experts, rows, h2d_ms, kernel_ms, d2h_ms);
+}
+
+void coli_cuda_tc_w4a16_rows(uint64_t *rows){
+    if(rows)*rows=0;
+    if(!g_cuda.available||!g_cuda.tc_w4a16_rows) return;
+    g_cuda.tc_w4a16_rows(rows);
 }
 
 void coli_cuda_group_stats_device(int device, uint64_t *calls, uint64_t *experts,

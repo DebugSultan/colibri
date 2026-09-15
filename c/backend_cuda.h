@@ -71,6 +71,8 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
     int device, uint64_t *calls, uint64_t *experts, uint64_t *rows,
     double *h2d_ms, double *kernel_ms, double *d2h_ms);
+/* Rows served by the W4A16 Tensor Core branch (routing oracle for TC_W4A16). */
+COLI_CUDA_DLLEXPORT void coli_cuda_tc_w4a16_rows(uint64_t *rows);
 
 /* Publish the E8 codebook (quant.h's e8_grid, 256x4 bytes) to every configured
  * device. Must be called after coli_cuda_init and before any fmt=6 upload; the
