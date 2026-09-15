@@ -1027,9 +1027,15 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         ref_n = (int)(sz / 8);
         ref_nll = malloc((size_t)ref_n * sizeof(float));
         ref_top = malloc((size_t)ref_n * sizeof(int));
-        if (fread(ref_nll, sizeof(float), (size_t)ref_n, rf) != (size_t)ref_n ||
-            fread(ref_top, sizeof(int), (size_t)ref_n, rf) != (size_t)ref_n) {
-            fprintf(stderr, "Q38_TF_REF: short read on %s\n", tf_ref); exit(1);
+        /* Interleaved layout (nll f32, argmax i32) per position. Reading it
+         * as two flat arrays instead compares unrelated values and the
+         * aggregate looks plausible while being meaningless. */
+        for (int i = 0; i < ref_n; i++) {
+            float f; int a;
+            if (fread(&f, 4, 1, rf) != 1 || fread(&a, 4, 1, rf) != 1) {
+                fprintf(stderr, "Q38_TF_REF: short read on %s\n", tf_ref); exit(1);
+            }
+            ref_nll[i] = f; ref_top[i] = a;
         }
         fclose(rf);
     }
