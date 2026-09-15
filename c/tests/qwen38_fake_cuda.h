@@ -87,6 +87,15 @@ int coli_cuda_expert_group_issue(ColiCudaTensor *const *g, ColiCudaTensor *const
     return 0;
 }
 const float *coli_cuda_expert_group_take(int device) { (void)device; return NULL; }
+/* Synchronous prefill group call (cb82a7c): the fake refuses it, so the tier
+ * takes its CPU fallback -- the same contract the real backend honours when a
+ * group cannot run. No test drives this path yet. */
+int coli_cuda_expert_group(ColiCudaTensor *const *g, ColiCudaTensor *const *u,
+                           ColiCudaTensor *const *d, const int *rows, int count,
+                           float *y, const float *x) {
+    (void)g; (void)u; (void)d; (void)rows; (void)count; (void)y; (void)x;
+    return 0;
+}
 void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d, double *kernel, double *d2h) {
     if (calls) *calls = 0; if (experts) *experts = 0; if (rows) *rows = 0;

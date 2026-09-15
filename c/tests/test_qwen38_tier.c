@@ -85,6 +85,40 @@ int main(void) {
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
 
+    /* --- 2b. the reserve is parametric (Q38T_DEV_RESERVE_MB) ---------------
+     * The 3.5 GiB default was measured in decode; in prefill the backend
+     * takes ~200 MB per card, so the breaking point is found by lowering
+     * this stepwise. The knob must move the headroom, survive the explicit
+     * budget clamp, and fall back to the default on junk. */
+    setenv("Q38T_DEV_RESERVE_MB", "16", 1);
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
+        printf("  FAIL: init with a parametric reserve\n");
+        return 1;
+    }
+    check(G.budget[0] == fake_free_bytes - ((size_t)16 << 20),
+          "Q38T_DEV_RESERVE_MB did not move the auto budget");
+    q38t_shutdown();
+
+    setenv("CUDA_EXPERT_GB", "100", 1);
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
+        printf("  FAIL: init with an explicit budget over a parametric reserve\n");
+        return 1;
+    }
+    check(G.budget[0] == fake_free_bytes - ((size_t)16 << 20),
+          "the explicit budget was not clamped to the parametric headroom");
+    q38t_shutdown();
+    unsetenv("CUDA_EXPERT_GB");
+
+    setenv("Q38T_DEV_RESERVE_MB", "junk", 1);
+    if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
+        printf("  FAIL: init with a junk reserve override\n");
+        return 1;
+    }
+    check(G.budget[0] == fake_free_bytes - Q38T_DEV_RESERVE,
+          "a junk Q38T_DEV_RESERVE_MB did not fall back to the default");
+    q38t_shutdown();
+    unsetenv("Q38T_DEV_RESERVE_MB");
+
     /* --- 3. COLI_GPU, the planner's singular, selects a device ----------- */
     unsetenv("COLI_GPUS");
     setenv("COLI_GPU", "0", 1);
