@@ -31,6 +31,7 @@
 typedef struct {
     ColiCudaTensor *tg, *tu, *td;
     uint32_t heat;
+    uint32_t arena_idx;                   /* slot index when the arena is on */
     uint8_t resident, queued, planned;
 } Q38TSlot;
 
@@ -46,6 +47,18 @@ static struct {
     size_t exp_bytes;                     /* VRAM estimate per expert */
     int dev[Q38T_MAX_DEV];
     size_t budget[Q38T_MAX_DEV], used[Q38T_MAX_DEV];
+    /* Expert arena: one cudaMalloc per device (pipe_alloc), slots of EXACT
+     * payload at fixed offsets, LIFO free-list under G.mx. A slot is taken
+     * where the budget is charged (q38t_offer / q38t_plan_fill) and given
+     * back where the charge is released (cancels, upload failure); a swap
+     * TRANSFERS the victim's slot to the replacement at enqueue time, so the
+     * free count always mirrors used[]/exp_bytes exactly. The tensors are
+     * built by coli_cuda_tensor_upload_into and own nothing, so the free
+     * list -- not cudaFree -- is the only recycling, and the +26% padding
+     * the six per-expert cudaMallocs paid (dev_alloc_footprint) is gone. */
+    uint8_t *arena[Q38T_MAX_DEV];
+    uint32_t *slot_free[Q38T_MAX_DEV];
+    int slot_free_n[Q38T_MAX_DEV];
     Q38TSlot *slot;                       /* [nl*ne] */
     pthread_mutex_t mx;
     pthread_t th;
@@ -108,6 +121,20 @@ static struct {
 
 static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
 static int home(int eid){ return eid % G.ndev; }
+
+/* Arena free-list. Every take and give happens under G.mx, in lockstep with
+ * the budget charge it mirrors; the uploader reads only the arena_idx it
+ * already owns. UINT32_MAX from arena_take means "no slot" -- the budget
+ * invariant (used+exp <= budget) makes it unreachable; if it ever happens
+ * the offer is dropped and counted, never served silently. */
+static uint32_t arena_take(int di){
+    if(!G.arena[di] || G.slot_free_n[di]<=0) return UINT32_MAX;
+    return G.slot_free[di][--G.slot_free_n[di]];
+}
+static void arena_give(int di, uint32_t idx){
+    if(!G.arena[di] || idx==UINT32_MAX) return;
+    G.slot_free[di][G.slot_free_n[di]++]=idx;
+}
 
 /* Reserve in bytes: Q38T_DEV_RESERVE_MB (MiB), default Q38T_DEV_RESERVE.
  * Read on every q38t_init -- once per process in production -- so tests can
@@ -175,20 +202,25 @@ static void *uploader(void *arg){
             ColiCudaTensor *a=v->tg,*b=v->tu,*c=v->td;
             v->tg=v->tu=v->td=NULL;
             pthread_mutex_unlock(&G.mx);
+            /* The tensors own nothing (arena), so this frees descriptors and
+             * accounting only. The victim's slot is NOT returned: it was
+             * transferred to the replacement at enqueue time. */
             if(a)coli_cuda_tensor_free(a);
             if(b)coli_cuda_tensor_free(b);
             if(c)coli_cuda_tensor_free(c);
         } else pthread_mutex_unlock(&G.mx);
 
         int dv=G.dev[home(eid)];
+        uint32_t aidx=qs(layer,eid)->arena_idx;
+        uint8_t *slotw=G.arena[home(eid)] + (size_t)aidx*G.exp_bytes;
+        float *slotsc=(float*)(slotw + 3*G.mat_bytes);
         /* gate/up are [inter,hidden], down is [hidden,inter]; the signature
-         * wants (I=input, O=output), not (rows, columns). The _g variant is
-         * used for both formats: with gs=0 it is the plain upload, and fmt=4
-         * needs gs to derive ng=(I+gs-1)/gs and the scale count. */
+         * wants (I=input, O=output), not (rows, columns). The arena slot is
+         * [gate|up|down][s_gate|s_up|s_down] at exact payload offsets. */
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
-        int ok = coli_cuda_tensor_upload_g(&tg, w,               sc,        G.fmt, G.D,  G.Ih, dv, G.gs)
-              && coli_cuda_tensor_upload_g(&tu, w+G.mat_bytes,   sc+G.sc,   G.fmt, G.D,  G.Ih, dv, G.gs)
-              && coli_cuda_tensor_upload_g(&td, w+2*G.mat_bytes, sc+2*G.sc, G.fmt, G.Ih, G.D,  dv, G.gs);
+        int ok = coli_cuda_tensor_upload_into(&tg, w,               sc,        G.fmt, G.D,  G.Ih, dv, G.gs, slotw,                 slotsc)
+              && coli_cuda_tensor_upload_into(&tu, w+G.mat_bytes,   sc+G.sc,   G.fmt, G.D,  G.Ih, dv, G.gs, slotw+G.mat_bytes,     slotsc+G.sc)
+              && coli_cuda_tensor_upload_into(&td, w+2*G.mat_bytes, sc+2*G.sc, G.fmt, G.Ih, G.D,  dv, G.gs, slotw+2*G.mat_bytes,   slotsc+2*G.sc);
         free(w); free(sc);
         pthread_mutex_lock(&G.mx);
         Q38TSlot *s=qs(layer,eid);
@@ -197,6 +229,7 @@ static void *uploader(void *arg){
                 G.upload_fail++;
                 if(G.used[hd]>=G.exp_bytes) G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* card really full: stop */
+                arena_give(hd,aidx);
                 if(tg)coli_cuda_tensor_free(tg);
                 if(tu)coli_cuda_tensor_free(tu);
                 if(td)coli_cuda_tensor_free(td); }
@@ -252,23 +285,16 @@ static void q38t_aff_widen(const q38t_affmask *m){ (void)m; }
 static void q38t_aff_restore(const q38t_affmask *m){ (void)m; }
 #endif
 
-/* VRAM an allocation of `bytes` really occupies (cudaMalloc granularity,
- * see the exp_bytes computation in q38t_init). */
-static size_t dev_alloc_footprint(size_t bytes){
-    /* measured with cudaMemGetInfo over 256 allocations each (driver 5xx):
-     *   400 B, 3 KiB, 4 KiB -> 8 KiB      10 KiB -> 16 KiB     16..64 KiB -> exact
-     *   96 KiB -> 104 KiB   384 KiB -> 416 KiB   768 KiB -> 1 MiB   1 MiB -> 1 MiB
-     *   1.5 MiB -> 2 MiB    3 MiB -> 4 MiB
-     * i.e. above 1 MiB multiples of 2 MiB, above 512 KiB one 1 MiB page, and
-     * below that roughly the size plus a sixteenth, in 8 KiB steps, 8 KiB
-     * minimum. The small-size rule is a fit, slightly conservative. */
-    const size_t KiB = 1024u, MiB = 1048576u;
-    if(bytes > MiB) return (bytes + 2*MiB - 1) / (2*MiB) * (2*MiB);
-    if(bytes > 512*KiB) return MiB;
-    size_t b = bytes + bytes/16;
-    if(b < 8*KiB) b = 8*KiB;
-    return (b + 8*KiB - 1) / (8*KiB) * (8*KiB);
-}
+/* VRAM an allocation of `bytes` really occupies: kept as documentation of the
+ * cudaMalloc granularity the arena exists to bypass. NOT compiled: the tier
+ * no longer pays the rounding (every expert is one payload slot), and a dead
+ * table would rot. The measured rule, driver 5xx, 256 allocations each:
+ *   400 B, 3 KiB, 4 KiB -> 8 KiB      10 KiB -> 16 KiB     16..64 KiB -> exact
+ *   96 KiB -> 104 KiB   384 KiB -> 416 KiB   768 KiB -> 1 MiB   1 MiB -> 1 MiB
+ *   1.5 MiB -> 2 MiB    3 MiB -> 4 MiB
+ * i.e. above 1 MiB multiples of 2 MiB, above 512 KiB one 1 MiB page, and
+ * below that roughly the size plus a sixteenth, in 8 KiB steps, 8 KiB
+ * minimum. */
 
 int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
               int native_fp8, int fmt, int gs){
@@ -319,6 +345,11 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.sc=(size_t)scale_count;
     G.fmt=fmt; G.gs=(fmt==4)?gs:0;
     G.mat_bytes=(fmt==4) ? (size_t)D*(size_t)Ih/2 : (size_t)D*(size_t)Ih;
+    /* The charge is the exact payload: the arena (below) stores experts at
+     * fixed offsets with no per-allocation rounding, so the budget counts
+     * real bytes. The old footprint charge billed 3.33 MiB for a 2.64 MiB
+     * int4 expert -- ~1900 experts per card lost to cudaMalloc granularity. */
+    G.exp_bytes = 3*G.mat_bytes + 3*G.sc*sizeof(float);
 
     /* Devices: COLI_GPUS="0,1" (default: first two visible devices).
      * COLI_GPU is the singular the planner writes for a one-device plan;
@@ -354,21 +385,12 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     }
     q38t_aff_restore(&aff);
 
-    /* Charge what the device allocator takes, not what the bytes measure:
-     * cudaMalloc rounds an allocation above 1 MiB up to a multiple of 2 MiB,
-     * one above 512 KiB up to 1 MiB, and small ones to 8 KiB steps
-     * (dev_alloc_footprint has the measured table).
-     * An expert is three weight allocations plus three scale allocations,
-     * whichever the format: fmt=4 halves the weight side and multiplies the
-     * scale side by 128*128/gs, which for gs=64 is a net ~2x more experts
-     * resident per card.
-     * Charged by payload, the fp8 qwen38 expert (3 x 1.56 MiB) looked like
-     * 4.69 MiB and took 6.03 MiB: the budget over-committed by ~28 % and the
-     * first "tensor allocation: out of memory" froze it permanently via the
-     * clamp (G.budget[hd]=G.used[hd] in the uploader). Now the planned count
-     * is the resident count. The 22-28 % the granularity costs is real; only
-     * pooling experts into one arena per device would win it back (open). */
-    G.exp_bytes = 3*dev_alloc_footprint(G.mat_bytes) + 3*dev_alloc_footprint(G.sc*sizeof(float));
+    /* The expert charge is the exact payload (set with the geometry above).
+     * It used to be the cudaMalloc footprint (3.33 MiB billed for a 2.64 MiB
+     * int4 expert): honest while each expert was six separate cudaMallocs,
+     * and the over-commit froze budgets permanently via the clamp
+     * (G.budget[hd]=G.used[hd] in the uploader). The arena below removes the
+     * rounding itself, so the charge follows it: real bytes, no slack. */
     /* How much VRAM to leave to the backend. One GiB was an eyeball estimate,
      * and it is measured wrong: the backend allocates its work tensors and
      * cuBLASLt workspaces AFTER the tier has already taken its weights, so
@@ -405,10 +427,53 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
                 G.dev[i], freeb/1073741824.0, reserve/1073741824.0,
                 b/1073741824.0, b/G.exp_bytes);
     }
+    /* Arena: exact payload slots instead of six rounded cudaMallocs per
+     * expert (dev_alloc_footprint bills 3.33 MiB for a 2.64 MiB int4 expert,
+     * ~1900 experts per card lost to rounding). One cudaMalloc per device,
+     * sized by the measured budget above; uploads go through
+     * coli_cuda_tensor_upload_into and own nothing, so the free-list is the
+     * only recycling and swaps stop paying free+malloc churn. All-or-nothing:
+     * if any card's arena fails, the tier declines -> CPU path, the same
+     * answer as any other backend failure. */
+    {
+        size_t payload = 3*G.mat_bytes + 3*G.sc*sizeof(float);
+        int ok = 1;
+        for(int i=0;i<G.ndev && ok;i++){
+            size_t slots = G.budget[i] / payload;
+            G.arena[i] = slots ? coli_cuda_pipe_alloc(G.dev[i], slots*payload) : NULL;
+            G.slot_free[i] = slots ? malloc(slots*sizeof(uint32_t)) : NULL;
+            ok = G.arena[i] && G.slot_free[i];
+            if(ok){
+                G.slot_free_n[i] = (int)slots;
+                for(size_t k=0;k<slots;k++) G.slot_free[i][k]=(uint32_t)k;
+                G.budget[i] = slots*payload;      /* exact charge from here on */
+                fprintf(stderr,"[q38tier] dev %d: arena %zu slots x %.2f MB payload"
+                               " (the old six-cudaMalloc charge was 3.33 MB/expert)\n",
+                        G.dev[i], slots, payload/1048576.0);
+            }
+        }
+        if(!ok){
+            for(int i=0;i<G.ndev;i++){
+                if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
+                free(G.slot_free[i]);
+                G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+            }
+            fprintf(stderr,"[q38tier] arena alloc failed -> CPU path\n");
+            return 0;   /* nothing else allocated yet: same as the early outs */
+        }
+    }
     G.slot=calloc((size_t)nl*ne,sizeof(Q38TSlot));
     G.is_x_floats=(size_t)G.ndev*Q38T_MAX_ROWS*D;
     G.is_x=malloc(G.is_x_floats*sizeof(float));
-    if(!G.slot||!G.is_x){ free(G.slot); free(G.is_x); return 0; }
+    if(!G.slot||!G.is_x){
+        free(G.slot); free(G.is_x);
+        for(int i=0;i<G.ndev;i++){
+            if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
+            free(G.slot_free[i]);
+            G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+        }
+        return 0;
+    }
 
     const char *hf=getenv("HEAT_FILE");
     if(hf){
@@ -431,7 +496,15 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     pthread_cond_init(&G.cv,NULL);
     pthread_cond_init(&G.cv_take,NULL);
     q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* the uploader inherits this mask */
-    if(pthread_create(&G.th,NULL,uploader,NULL)!=0){ free(G.slot); free(G.is_x); return 0; }
+    if(pthread_create(&G.th,NULL,uploader,NULL)!=0){
+        free(G.slot); free(G.is_x);
+        for(int i=0;i<G.ndev;i++){
+            if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
+            free(G.slot_free[i]);
+            G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+        }
+        return 0;
+    }
     q38t_aff_restore(&aff);
     G.on=1;
     fprintf(stderr,"[q38tier] CUDA VRAM expert tier active: %d device(s), "
@@ -527,20 +600,31 @@ void q38t_offer(int layer,int eid,
             if(s->resident||s->queued||!s->planned){
                 if(s->planned){
                     if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+                    arena_give(di,s->arena_idx);
                     s->planned=0;
                 }
                 pthread_mutex_unlock(&G.mx); goto out;
             }
             if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
-            else { if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes; s->planned=0; }
+            else { if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+                   arena_give(di,s->arena_idx); s->planned=0; }
             pthread_mutex_unlock(&G.mx); goto out;
         }
     }
 
     if(G.used[di]+G.exp_bytes<=G.budget[di]){
-        G.used[di]+=G.exp_bytes;
-        if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
-        else G.used[di]-=G.exp_bytes;
+        uint32_t idx=arena_take(di);
+        if(idx!=UINT32_MAX){
+            G.used[di]+=G.exp_bytes;
+            s->arena_idx=idx;
+            if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
+            else { G.used[di]-=G.exp_bytes; arena_give(di,idx); }
+        } else {
+            /* Unreachable while the budget invariant holds; never silent. */
+            fprintf(stderr,"[q38tier] dev %d: arena exhausted with used %.2f/%.2f GB"
+                           " -- offer dropped\n",
+                    G.dev[di], G.used[di]/1073741824.0, G.budget[di]/1073741824.0);
+        }
         pthread_mutex_unlock(&G.mx); goto out;
     }
 
@@ -562,7 +646,13 @@ void q38t_offer(int layer,int eid,
             Q38TSlot *v=&G.slot[cold];
             v->resident=0;                       /* from now on it is CPU fallback */
             if(enqueue_locked(layer,eid,(int)(cold/G.ne),(int)(cold%G.ne),
-                              gate,up,down,scales)) G.swaps++;
+                              gate,up,down,scales)){
+                G.swaps++;
+                s->arena_idx=v->arena_idx;       /* the replacement inherits the
+                                                    victim's slot; the uploader
+                                                    frees the victim's tensors
+                                                    before writing this slot */
+            }
             else v->resident=1;                  /* queue full: put it back */
         }
     }
@@ -808,7 +898,10 @@ int q38t_plan_fill(int *layers,int *eids,int max){
         Q38TSlot *s=&G.slot[i];
         if(s->resident||s->queued||s->planned) continue;
         if(G.used[di]+G.exp_bytes>G.budget[di]) continue;
+        uint32_t idx=arena_take(di);
+        if(idx==UINT32_MAX) continue;         /* budget invariant broken: skip */
         G.used[di]+=G.exp_bytes;
+        s->arena_idx=idx;
         s->planned=1;
         layers[out]=layer; eids[out]=eid; out++;
     }
@@ -823,6 +916,7 @@ void q38t_cancel_plan(int layer,int eid){
     if(s->planned&&!s->queued&&!s->resident){
         int di=home(eid);
         if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+        arena_give(di,s->arena_idx);
         s->planned=0;
         G.plan_cancels++;
     }
@@ -934,6 +1028,12 @@ void q38t_shutdown(void){
     }
     free(G.slot); free(G.is_x); free(G.pf_x); free(G.pf_y); G.pf_x=G.pf_y=NULL; G.pf_floats=0; free(G.fill_order); free(G.heat0);
     G.slot=NULL; G.is_x=NULL; G.fill_order=NULL; G.heat0=NULL;
+    /* The tensors own nothing, so the arena dies after them, whole. */
+    for(int i=0;i<G.ndev;i++){
+        if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
+        free(G.slot_free[i]);
+        G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+    }
     G.on=0;
 }
 

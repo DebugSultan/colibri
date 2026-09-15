@@ -94,6 +94,7 @@ typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, 
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs);
+typedef int            (*fn_tensor_upload_into)(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs, void *dev_weights, float *dev_scales);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -173,6 +174,7 @@ static struct {
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_upload_g tensor_upload_g;
+    fn_tensor_upload_into tensor_upload_into;
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
@@ -1420,6 +1422,7 @@ static int coli_cuda_load(void){
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_upload_g, fn_tensor_upload_g)
+    RESOLVE_OPT(tensor_upload_into, fn_tensor_upload_into)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
@@ -1609,6 +1612,11 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
 int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs){
     if(!g_cuda.available || !g_cuda.tensor_upload_g){ return 0; }
     return g_cuda.tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs);
+}
+
+int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int device, int gs, void *dev_weights, float *dev_scales){
+    if(!g_cuda.available || !g_cuda.tensor_upload_into){ return 0; }
+    return g_cuda.tensor_upload_into(tensor, weights, scales, fmt, I, O, device, gs, dev_weights, dev_scales);
 }
 
 int coli_cuda_e8_set_grid(const void *grid){

@@ -66,6 +66,7 @@ struct ColiCudaTensor {
     size_t scale_count;        /* floats in `scales`: O per-row, O*ng grouped */
     int tracked;
     int weights_owned;
+    int scales_owned;          /* 0 = scales live in a caller-owned arena slot */
 #ifdef COLI_ANS
     size_t archive_bytes;
     int compressed;
@@ -1382,6 +1383,22 @@ static thread_local int g_upload_gs = 0;
 extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
                                          const void *weights, const float *scales,
                                          int fmt, int I, int O, int device, int gs);
+/* Descriptor fill shared by the allocating upload and the arena (_into)
+ * upload, so the two cannot drift. Returns 0 for an unsupported format. */
+static int tensor_fill_desc(ColiCudaTensor *t, int fmt, int I, int O, int device){
+    size_t rb = row_bytes(fmt, I);
+    if (!rb) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
+    t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
+    t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
+    t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
+    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
+        t->ng = (I + 127) / 128;
+        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
+    }
+    if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
+    return 1;
+}
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
@@ -1398,21 +1415,10 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    size_t rb = row_bytes(fmt, I);
-    /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
-     * quantized format that legitimately arrives with scales == NULL. */
-    if (!rb || (fmt && fmt != 6 && !scales)) return 0;
+    if (!row_bytes(fmt, I) || (fmt && fmt != 6 && !scales)) return 0;
     if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
-    if (!t) return 0;
-    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
-    t->gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
-    t->ng = t->gs ? (I + t->gs - 1) / t->gs : 1;
-    t->scale_count = t->gs ? (size_t)O * (size_t)t->ng : (size_t)O;
-    if (fmt == 8) {   /* per-128x128-block scales: [ceil(O/128), ceil(I/128)] */
-        t->ng = (I + 127) / 128;
-        t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
-    }
+    if (!t || !tensor_fill_desc(t, fmt, I, O, device)) { std::free(t); return 0; }
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
@@ -1434,8 +1440,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
             coli_cuda_tensor_free(t);
             return 0;
         }
+        t->scales_owned=1;
     }
-    if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
@@ -1449,6 +1455,45 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
     int r = coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device);
     g_upload_gs = 0;
     return r;
+}
+/* Arena upload: the storage is the CALLER's device memory (one expert-arena
+ * slot), so the returned tensor owns nothing -- tensor_free releases the
+ * descriptor and the accounting but never cudaFree()s the weights or the
+ * scales. Everything else (H2D copies, the int4 sign flip, accounting)
+ * matches the allocating upload exactly, via the shared descriptor fill. */
+extern "C" int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor,
+        const void *weights, const float *scales,
+        int fmt, int I, int O, int device, int gs,
+        void *dev_weights, float *dev_scales){
+    if (!tensor || *tensor || !weights || !dev_weights || !dev_scales) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    if (fmt && fmt != 6 && !scales) return 0;
+    if (fmt == 8 && !g_fp8_lut_ready) return 0;
+    g_upload_gs = gs>0 ? gs : 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    int desc_ok = t && tensor_fill_desc(t, fmt, I, O, device);
+    g_upload_gs = 0;
+    if (!desc_ok) { std::free(t); return 0; }
+    t->weights = dev_weights; t->scales = dev_scales;
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "arena weight upload")) {
+        std::free(t);
+        return 0;
+    }
+    if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
+        offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+        if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){std::free(t);return 0;}}
+    if (fmt && fmt != 6) {
+        if (!cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "arena scale upload")) {
+            std::free(t);
+            return 0;
+        }
+    }
+    t->tracked = 1;
+    ctx->tensor_count++;
+    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
+    *tensor = t;
+    return 1;
 }
 
 #ifdef COLI_ANS
@@ -1524,6 +1569,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
            !cuda_ok(cudaMalloc(&t->scales,scale_bytes),"ANS sidecar scales")){
             coli_cuda_tensor_free(t);return 0;
         }
+        t->scales_owned=1;
         g_ans_stage_s+=ans_now_s()-t0;
         t0=ans_now_s();
 #if defined(__linux__)
@@ -2388,7 +2434,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
     if (tensor->weights&&tensor->weights_owned) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->scales&&tensor->scales_owned) cudaFree(tensor->scales);
     for(int i=0;i<tensor->ragged_count;i++)ragged_kv_clear(&tensor->ragged[i]);
     std::free(tensor);
 }

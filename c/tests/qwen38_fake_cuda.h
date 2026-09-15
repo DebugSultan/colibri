@@ -102,4 +102,24 @@ void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
     if (h2d) *h2d = 0; if (kernel) *kernel = 0; if (d2h) *d2h = 0;
 }
 
+/* Arena upload: same recording as the plain upload; the fake has no device
+ * memory, so the caller's slot pointers are accepted and ignored. The tier
+ * must behave identically apart from where the bytes land. */
+int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor, const void *weights,
+                                 const float *scales, int fmt, int I, int O,
+                                 int device, int gs, void *dev_weights,
+                                 float *dev_scales) {
+    (void)scales; (void)dev_weights; (void)dev_scales;
+    if (!tensor || *tensor) return 0;
+    return upload_common(tensor, weights, fmt, I, O, device, gs);
+}
+void *coli_cuda_pipe_alloc(int device, size_t bytes) {
+    (void)device;
+    return malloc(bytes);   /* stands in for cudaMalloc; freed by pipe_free */
+}
+void coli_cuda_pipe_free(int device, void *p) {
+    (void)device;
+    free(p);
+}
+
 #endif /* QWEN38_FAKE_CUDA_H */
