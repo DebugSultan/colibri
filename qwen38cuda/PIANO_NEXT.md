@@ -379,7 +379,7 @@ f32 per 64):**
 
 | livello | contenuto | GiB |
 |---|---|---|
-| VRAM | ~8,5k esperti caldi **int4** (~22,4) + MTP int4 (~1,5) + head (1,2) + KV q8_0 (~1,6) | ~27-28 |
+| VRAM | ~8,5k esperti caldi **int4** (~22,4) + MTP int4 (~1,5) + head (1,2) + KV q8_0 2×200k (~4,9, vedi riga 15/09) | ~30 |
 | RAM | ~16,5k esperti int4 (~44) + dense (5,4) + workspace (2-3) | ~50-52 |
 | SSD | PLE (47,75) + ViT + fallback FP8 | — |
 
@@ -605,3 +605,4 @@ restano su CPU.
 | 07/09 | `config.json` letta e messa a verbale (§1.1) — multimodalità e le 943 voci non-convertite sono novità rispetto alla ricognizione |
 | 07/09 | NVFP4 verificato sui sorgenti e **scartato** (§5); int4 `g4` promosso a Fase 1 (§6) |
 | — | **Fase 0 sbloccata** (il checkpoint c'è): attende il via |
+| 15/09 | **KV: requisito del titolare 2 parallele × 180-200k + bench «KV in RAM vs KV in VRAM» in coda finestra** — aritmetica dal config (48 layer: 36 DeltaNet a stato costante ~113 MB/seq f32, 12 full-attn GQA 2×256, interval 4; indexer budget-capped ~24 MB costante): KV per token 24 KiB f16 / 12 KiB q8 ⇒ **2×200k: 9,8 GiB f16 / 4,9 GiB q8** (il «KV ~1,6» della tabella era a contesto corto: corretto). **La fisica**: la lettura KV per token è O(context) ⇒ a 2×200k ogni token rilegge 4,9 GB: in VRAM ~5 ms/token (rumore), da RAM su PCIe ~200 ms/token ⇒ **a residenza piena il KV-in-RAM diventa il collo, più degli esperti** (col 27B denso era peggiorativa per lo stesso motivo ma 48/48 layer). Capienza decide: tier int4 22,4 + MTP 1,5 + head 1,2 + KV q8 4,9 = **30/32 ci sta al soffitto**; con F16 34,9 NON ci sta (solo con tier ridotto ~6,5k). Bench disegnato a 3 bracci (tutti 2×200k, misura tg): **KV-VRAM q8** / KV-RAM q8 / KV-RAM f16; F32 mai (condiviso); F16-in-VRAM scartato a priori per capienza salvo interesse esplicito per il tier ridotto. Controllo ereditato q8_0-gratis (0,99× sul 27B) si RIMISURA qui, non si eredita. |
