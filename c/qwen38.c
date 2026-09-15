@@ -1027,9 +1027,15 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
         ref_n = (int)(sz / 8);
         ref_nll = malloc((size_t)ref_n * sizeof(float));
         ref_top = malloc((size_t)ref_n * sizeof(int));
-        if (fread(ref_nll, sizeof(float), (size_t)ref_n, rf) != (size_t)ref_n ||
-            fread(ref_top, sizeof(int), (size_t)ref_n, rf) != (size_t)ref_n) {
-            fprintf(stderr, "Q38_TF_REF: short read on %s\n", tf_ref); exit(1);
+        /* layout interleaved (nll f32, argmax i32) per posizione — la prima
+         * versione leggeva due array piatti e confrontava spazzatura: mean
+         * 0.66 vs delta aggregato 0.137, top1 1.6% senza senso. */
+        for (int i = 0; i < ref_n; i++) {
+            float f; int a;
+            if (fread(&f, 4, 1, rf) != 1 || fread(&a, 4, 1, rf) != 1) {
+                fprintf(stderr, "Q38_TF_REF: short read on %s\n", tf_ref); exit(1);
+            }
+            ref_nll[i] = f; ref_top[i] = a;
         }
         fclose(rf);
     }
