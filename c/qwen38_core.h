@@ -159,6 +159,12 @@ typedef struct {
      * that model would end up computing on slots sized for the first
      * model's geometry. */
     int tier;
+    /* Backend format number the tier was initialized with (8 = fp8 e4m3,
+     * 4 = int4 grouped). One tier stages ONE format, so the offer sites
+     * compare the slot's kind against this and stay silent for the rest --
+     * an expert that fell back to fp8 inside an int4 run must not be
+     * uploaded as int4. */
+    int tier_fmt;
     int prefill_batch;
     uint64_t resident_weight_bytes;
     double dense_load_s;
@@ -852,6 +858,8 @@ static void q38_vision_detach(Model *m) {
     m->vis_rows=NULL; m->vis_map=NULL; m->vis_map_len=0; m->vis_rows_n=0;
 }
 
+static int q38_int4_tier_geometry(Model *m,int *gs_out,int *scale_count_out);
+
 static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
@@ -931,8 +939,22 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
      * knowing. The scales of ONE matrix are fp8_nblk(inter)*fp8_nblk(hidden),
      * the same count q38_prepare_expert_scale_bank does for its bank. Nothing
      * is promoted here: at this point no expert has been read yet. */
-    m->tier=q38t_init(c->layers,c->experts,c->hidden,c->inter,c->topk,
-                      (int)(fp8_nblk(c->inter)*fp8_nblk(c->hidden)),m->native_fp8);
+    {
+        /* fmt=8 unless an int4 container is actually mounted AND its geometry
+         * reads back: the group size is derived from the qs byte count, never
+         * declared, so it has to be measured off a real expert pair. If the
+         * container is mounted but unreadable here the tier stays on fp8,
+         * which is what the experts will fall back to anyway. */
+        int fmt=8,gs=0;
+        int scale_count=(int)(fp8_nblk(c->inter)*fp8_nblk(c->hidden));
+        int i4_gs=0,i4_sc=0;
+        if(q38_int4_tier_geometry(m,&i4_gs,&i4_sc)){
+            fmt=4; gs=i4_gs; scale_count=i4_sc;
+        }
+        m->tier_fmt=fmt;
+        m->tier=q38t_init(c->layers,c->experts,c->hidden,c->inter,c->topk,
+                          scale_count,m->native_fp8,fmt,gs);
+    }
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
                    "FP8=%s, BF16=%s (resident matrices %.2f GiB)\n",m->prefix,c->layers,c->ple_layer,cap,
                    m->native_fp8?"native":"expanded-f32",m->native_bf16?"native":"expanded-f32",
@@ -1237,7 +1259,34 @@ static int q38_int4_group_size(const Cfg *c,int64_t qs_bytes) {
     return gs;
 }
 
-static void q38_bind_int4_slot(Slot *slot,void *merged,void *qs,
+/* The tier must know the expert format BEFORE the first expert is read, so
+ * the first pair in range is looked up and measured. Every other expert
+ * binds at the same gs or not at all: q38_load_int4_ranges exits on a pair
+ * whose geometry disagrees, so one probe settles the whole container. All
+ * three matrices bill hidden*inter/gs scales, because q38_int4_group_size
+ * only accepts a gs that divides both axes. */
+static int q38_int4_tier_geometry(Model *m,int *gs_out,int *scale_count_out) {
+    if(!m->int4_active)return 0;
+    st_tensor *weight[2];
+    for(int l=m->range_begin;l<m->range_end;l++)
+        for(int e=0;e<m->c.experts;e++){
+            if(!q38_int4_expert_tensors(m,l,e,weight))continue;
+            int gs=q38_int4_group_size(&m->c,weight[1]->nbytes);
+            if(!gs)return 0;
+            *gs_out=gs;
+            *scale_count_out=(int)((int64_t)m->c.hidden*m->c.inter/gs);
+            return 1;
+        }
+    return 0;
+}
+
+/* qs is float* and NOT void*: the three scale offsets below are COUNTS OF
+ * FLOATS, and with a void* the compiler scales them by 1 instead of by 4.
+ * That is exactly the defect this typing prevents -- up and down were bound
+ * a quarter and a half into gate's own scale block, which stays plausible
+ * enough (they are still scales of the same expert) that the text reads
+ * fine and only the d3 top-1 suffers. Keep the type. */
+static void q38_bind_int4_slot(Slot *slot,void *merged,float *qs,
                                int hidden,int inter,int gs) {
     q38_weight_free(&slot->gate);q38_weight_free(&slot->up);
     q38_weight_free(&slot->down);
@@ -1250,7 +1299,7 @@ static void q38_bind_int4_slot(Slot *slot,void *merged,void *qs,
             slot->i4_slab=replacement;slot->i4_slab_bytes=slab_bytes;
         }
         merged=slot->i4_slab;
-        qs=(unsigned char*)slot->i4_slab+((int64_t)3*inter*hidden+1)/2;
+        qs=(float*)((unsigned char*)slot->i4_slab+((int64_t)3*inter*hidden+1)/2);
     }
     int64_t matrix_bytes=(int64_t)inter*hidden/2;
     int64_t gate_scales=(int64_t)inter*(hidden/gs);
@@ -1271,7 +1320,7 @@ static void q38_load_int4_ranges(Model *m,int layer,int expert,Slot *slot,
         const uint8_t *pm=(const uint8_t*)st_map_shard_range(weight[0]->fd,weight[0]->off,weight[0]->nbytes);
         const uint8_t *ps=(const uint8_t*)st_map_shard_range(weight[1]->fd,weight[1]->off,weight[1]->nbytes);
         if(pm&&ps){
-            q38_bind_int4_slot(slot,(void*)pm,(void*)ps,c->hidden,c->inter,gs);
+            q38_bind_int4_slot(slot,(void*)pm,(float*)ps,c->hidden,c->inter,gs);
             if(slot->i4_slab){free(slot->i4_slab);slot->i4_slab=NULL;slot->i4_slab_bytes=0;}
             return;
         }
@@ -1466,6 +1515,18 @@ static Slot *q38_expert_get(Model *m,int layer,int eid) {
  * Without HEAT_FILE q38t_plan_fill returns 0 on the first call and nothing
  * is read: cold, there is no sensible order to invent, and the hot
  * promotion of decode already does the job. */
+/* An expert is stageable only in the format the tier was initialized with.
+ * Mixing is not a matter of taste: the uploader has one G.fmt, one
+ * G.mat_bytes and one G.sc, so a slot of the other kind would be copied and
+ * uploaded with the wrong strides. The three matrices also have to be the
+ * borrowed-contiguous layout the staging assumes, which both binders
+ * produce. */
+static int q38_tier_stageable(Model *m,const Slot *ex) {
+    if(!ex||!ex->gate.scales)return 0;
+    return m->tier_fmt==4 ? ex->gate.kind==Q38_WEIGHT_I4
+                          : ex->gate.kind==Q38_WEIGHT_FP8;
+}
+
 static void q38_tier_warmstart(Model *m) {
     if(!m->tier) return;
     enum { BATCH=64 };
@@ -1480,7 +1541,7 @@ static void q38_tier_warmstart(Model *m) {
             if(layers[i]<m->range_begin||layers[i]>=m->range_end){
                 q38t_cancel_plan(layers[i],eids[i]); continue; }
             Slot *ex=q38_expert_get(m,layers[i],eids[i]);
-            if(ex->gate.kind!=Q38_WEIGHT_FP8||!ex->gate.scales){
+            if(!q38_tier_stageable(m,ex)){
                 q38t_cancel_plan(layers[i],eids[i]); continue; }
             q38t_offer(layers[i],eids[i],(const uint8_t*)ex->gate.data,
                        (const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
@@ -1995,7 +2056,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
              * staging immediately, so the slot can be evicted on the next
              * round -- which with COLI_MAP_EXPERTS=1 would also unmap the
              * mapping. */
-            if(m->tier&&ex->gate.kind==Q38_WEIGHT_FP8&&ex->gate.scales)
+            if(m->tier&&q38_tier_stageable(m,ex))
                 q38t_offer(layer,need[n],(const uint8_t*)ex->gate.data,
                            (const uint8_t*)ex->up.data,(const uint8_t*)ex->down.data,
                            ex->gate.scales,0);
