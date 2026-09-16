@@ -160,7 +160,14 @@ static void arena_give(int di, uint32_t idx){
  * warmstart while the dense tensors upload lazily on first use, so whatever the
  * arena takes, the dense set never sees. A larger reserve on the strong card is
  * how you hand that card to the dense path without starving the weak one of
- * experts. A device id past the end of the list falls back to the default. */
+ * experts. A device id past the end of the list falls back to the default.
+ *
+ * INDEX SPACE: the list is indexed by the engine's own device ids -- CUDA
+ * enumeration, which is fastest-first and NOT nvidia-smi's PCI order on a mixed
+ * machine. The "[q38dense] rank" line at startup names every id ("dev 0 (NVIDIA
+ * GeForce RTX 5070 Ti, ...)"); write the list against THAT, or invert the intent
+ * silently -- the first asymmetric run did exactly that and starved the strong
+ * card of the dense reserve it was being given. */
 static size_t dev_reserve_for(int device){
     const char *m=getenv("Q38T_DEV_RESERVE_MB");
     if(!m || !*m) return Q38T_DEV_RESERVE;
@@ -1168,8 +1175,10 @@ static void dense_rank(void){
     for(int i=0;i<DG.ndev;i++){
         int a=0,b=0;
         for(int k=0;k<DG.ndev;k++) if(DG.dev[k]==DG.rank[i]){ a=sm[k]; b=pw[k]; break; }
-        fprintf(stderr,"[q38dense] rank %d: dev %d (%d SM, PCIe x%d)%s\n",
-                i,DG.rank[i],a,b,i?"":"  <- preferred for dense");
+        char nm[64]={0};
+        coli_cuda_device_name(DG.rank[i],nm,sizeof nm);
+        fprintf(stderr,"[q38dense] rank %d: dev %d (%s, %d SM, PCIe x%d)%s\n",
+                i,DG.rank[i],nm[0]?nm:"unknown",a,b,i?"":"  <- preferred for dense");
     }
 }
 
