@@ -1060,4 +1060,172 @@ void q38t_shutdown(void){
     G.on=0;
 }
 
+/* ---- dense BF16 matmul on the GPU (Q38_DENSE_GPU=1) ------------------------
+ *
+ * WHY THIS EXISTS, measured rather than assumed: reading the checkpoint's own
+ * shapes and dtypes, one decode token moves 9.41 GiB, of which 8.17 GiB (86.9%)
+ * is the DENSE resident set -- DeltaNet in_proj 34.6%, the gated residual 15.0%,
+ * attention q/k/v/o 14.8%, lm_head 14.5%, DeltaNet out_proj 12.9%, the shared
+ * expert 5.5% -- and only 13.1% is routed experts. At the measured 2.83 s/token
+ * that is 3.57 GB/s effective, against ~50 GB/s of host RAM and ~900 GB/s of
+ * VRAM sitting idle. The expert tier cannot reach any of it: every dense weight
+ * is bf16 and the backend had no bf16 format, so every dense matmul stayed on
+ * the CPU by construction. fmt=9 (backend_cuda.cu) removes that, and this is
+ * the engine-side door to it.
+ *
+ * Deliberately independent of the expert tier's G state: the tier refuses to
+ * attach for reasons that say nothing about the dense side (a second model in
+ * the process, an expert format it does not stage), and the dense set is worth
+ * VRAM regardless. The only shared resource is the backend's device context,
+ * which is why this NEVER calls coli_cuda_init when one already exists --
+ * coli_cuda_init resets g_nctx and would orphan every resident expert tensor. */
+
+typedef struct {
+    ColiCudaTensor *t;
+    int device;
+    int refused;            /* sticky: never re-attempt a failed 1 GiB upload */
+    int counted;            /* its bytes are already in DG.bytes */
+} Q38TDense;
+
+static struct {
+    int checked, wanted;      /* env gate, resolved once */
+    int attached;             /* 0 = not tried, 1 = context adopted, -1 = refused */
+    int ndev, dev[Q38T_MAX_DEV];
+    uint64_t calls, rows, refusals;
+    size_t bytes;
+} DG;
+
+/* The env gate alone: cheap, touches no CUDA, and safe to call during the
+ * model load. Device discovery is deliberately NOT done here. q38t_init runs
+ * AFTER the weights are loaded and calls coli_cuda_init, which resets g_nctx --
+ * so a context built at load time would be silently discarded under us. The
+ * attach below therefore happens on first use, by which point the expert tier
+ * has already built (or declined to build) the context we should be sharing. */
+int q38t_dense_enabled(void){
+    if(!DG.checked){
+        DG.checked=1;
+        const char *e=getenv("Q38_DENSE_GPU");
+        DG.wanted=(e && *e=='1');
+    }
+    return DG.wanted;
+}
+
+/* First use: adopt the existing device context if there is one, bootstrap our
+ * own only if nobody has. Never re-init an existing context. */
+static int dense_attach(void){
+    if(DG.attached) return DG.attached>0;
+    if(!q38t_dense_enabled()){ DG.attached=-1; return 0; }
+    DG.attached=-1;
+
+    int have=coli_cuda_device_count();
+    if(have>0){
+        for(int i=0;i<have && DG.ndev<Q38T_MAX_DEV;i++){
+            int d=coli_cuda_device_at(i);
+            if(d>=0) DG.dev[DG.ndev++]=d;
+        }
+    } else {
+        const char *gl=getenv("COLI_GPUS");
+        if(!gl || !*gl) gl=getenv("COLI_GPU");
+        if(gl && *gl){
+            char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
+            for(char *t=strtok(buf,","); t && DG.ndev<Q38T_MAX_DEV; t=strtok(NULL,","))
+                DG.dev[DG.ndev++]=atoi(t);
+        } else {
+            int available=coli_cuda_available_device_count();
+            int want=available<2?available:2;
+            for(int i=0;i<want && i<Q38T_MAX_DEV;i++) DG.dev[DG.ndev++]=i;
+        }
+        if(DG.ndev<1){
+            fprintf(stderr,"[q38dense] no visible CUDA devices -> CPU path\n");
+            return 0;
+        }
+        q38t_affmask aff; q38t_aff_get(&aff); q38t_aff_widen(&aff);
+        if(!coli_cuda_init(DG.dev,DG.ndev)){
+            fprintf(stderr,"[q38dense] coli_cuda_init failed -> CPU path\n");
+            DG.ndev=0; return 0;
+        }
+        DG.ndev=coli_cuda_device_count();
+    }
+    if(DG.ndev<1) return 0;
+    DG.attached=1;
+    fprintf(stderr,"[q38dense] bf16 dense matmuls on GPU, %d device(s)\n",DG.ndev);
+    return 1;
+}
+
+/* Least-loaded placement: the card with the most free VRAM takes the tensor.
+ * With two cards and a dense set that does not fit on one, this is what spreads
+ * lm_head and the DeltaNet projections across them without a placement table. */
+static int dense_pick_device(size_t need){
+    int best=-1; size_t best_free=0;
+    for(int i=0;i<DG.ndev;i++){
+        size_t fr=0,tot=0;
+        if(!coli_cuda_mem_info(DG.dev[i],&fr,&tot)) continue;
+        if(fr>best_free){ best_free=fr; best=DG.dev[i]; }
+    }
+    /* Leave the backend room for its activation scratch: a tensor that fits
+     * with nothing to spare turns the next allocation into the failure. */
+    if(best<0 || best_free < need + (size_t)256*1024*1024) return -1;
+    return best;
+}
+
+int q38t_dense_matmul(void **slot, float *y, const float *x, const uint16_t *w,
+                      int S, int I, int O){
+    if(!slot || !y || !x || !w || S<1 || I<1 || O<1) return 0;
+    if(!dense_attach()) return 0;
+
+    Q38TDense *d=(Q38TDense*)*slot;
+    if(!d){
+        d=(Q38TDense*)calloc(1,sizeof *d);
+        if(!d) return 0;
+        d->device=-1;
+        *slot=d;
+    }
+    if(d->refused) return 0;
+
+    if(!d->t){
+        size_t need=(size_t)I*(size_t)O*2;
+        int dev=dense_pick_device(need);
+        if(dev<0){
+            fprintf(stderr,"[q38dense] [%d,%d] bf16 (%.2f GiB) does not fit -> CPU "
+                           "for this weight\n",O,I,need/1073741824.0);
+            d->refused=1; DG.refusals++; return 0;
+        }
+        d->device=dev;
+    }
+    /* fmt=9, scales NULL, gs 0: the first call uploads and the device copy is
+     * reused from then on. A failure here is also sticky -- if the upload could
+     * not be made once, retrying it per token only buys a slower CPU path. */
+    if(!coli_cuda_matmul(&d->t, y, x, w, NULL, 9, S, I, O, d->device, 0)){
+        if(!d->t){
+            fprintf(stderr,"[q38dense] upload of [%d,%d] bf16 failed -> CPU for "
+                           "this weight\n",O,I);
+            d->refused=1; DG.refusals++;
+        }
+        return 0;
+    }
+    if(!d->counted && d->t){       /* charge the residency once, at first success */
+        DG.bytes += coli_cuda_tensor_bytes(d->t);
+        d->counted=1;
+        fprintf(stderr,"[q38dense] resident [%d,%d] bf16 on dev%d, %.2f GiB total\n",
+                O,I,d->device,DG.bytes/1073741824.0);
+    }
+    DG.calls++; DG.rows+=(uint64_t)S;
+    return 1;
+}
+
+void q38t_dense_release(void **slot){
+    if(!slot||!*slot) return;
+    Q38TDense *d=(Q38TDense*)*slot;
+    if(d->t) coli_cuda_tensor_free(d->t);
+    free(d);
+    *slot=NULL;
+}
+
+void q38t_dense_stats(void){
+    if(DG.attached<=0) return;
+    fprintf(stderr,"[q38dense] calls=%llu rows=%llu resident=%.2f GiB refused=%llu\n",
+            (unsigned long long)DG.calls,(unsigned long long)DG.rows,
+            DG.bytes/1073741824.0,(unsigned long long)DG.refusals);
+}
+
 #endif /* COLI_CUDA */

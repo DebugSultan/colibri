@@ -98,6 +98,25 @@
 int  q38t_init(int n_layers, int n_experts, int hidden, int inter, int topk,
                int scale_count, int native_fp8, int fmt, int gs);
 int  q38t_ready(void);
+/* ---- dense BF16 matmul on the GPU (Q38_DENSE_GPU=1) ------------------------
+ * Independent of the expert tier: the dense set is 86.9% of the per-token
+ * decode byte traffic and is bf16 with no scales, so it is worth VRAM even
+ * on a run where the expert tier refused to attach. The weight is uploaded
+ * ONCE (fmt=9) and the device copy is cached in *slot, which the caller owns
+ * and must release through q38t_dense_release.
+ *
+ *   slot: address of the caller's cache pointer, NULL-initialized.
+ *   w:    the bf16 weight, [O,I] row-major -- exactly what the CPU kernel reads.
+ *
+ * Returns 1 when the GPU served it (y is written) and 0 when the caller must
+ * stay on the CPU. A refusal is STICKY per weight: a tensor that would not fit
+ * must not re-attempt a 1 GiB cudaMalloc on every token. */
+int  q38t_dense_matmul(void **slot, float *y, const float *x, const uint16_t *w,
+                       int S, int I, int O);
+void q38t_dense_release(void **slot);
+int  q38t_dense_enabled(void);
+void q38t_dense_stats(void);
+
 int  q38t_is_resident(int layer, int eid);
 void q38t_shutdown(void);
 
@@ -195,6 +214,10 @@ void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int));
 
 static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g,int h,int i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
 static inline int  q38t_ready(void){return 0;}
+static inline int  q38t_dense_matmul(void**a,float*b,const float*c,const uint16_t*d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline void q38t_dense_release(void**a){(void)a;}
+static inline int  q38t_dense_enabled(void){return 0;}
+static inline void q38t_dense_stats(void){}
 static inline int  q38t_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void q38t_shutdown(void){}
 static inline void q38t_note(int a,const int*b,int c){(void)a;(void)b;(void)c;}
