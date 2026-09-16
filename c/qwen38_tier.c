@@ -1236,11 +1236,29 @@ static int dense_attach(void){
  * touching the weak one is the point, not a side effect: the overflow onto the
  * second card is a fallback, and the stats say how much of it happened.
  *
- * The 256 MiB margin leaves the backend room for its activation scratch; a
- * tensor that fits with nothing to spare turns the NEXT allocation into the
- * failure, which is a much harder thing to read in a log. */
+ * The margin leaves the backend room for its activation scratch. 256 MiB was
+ * measured against the LAZY door, which throttles itself mid-forward and never
+ * spends a reserve down to the last byte; EAGER staging does spend it, and the
+ * first asymmetric run (reserve 1024,6144) ate the list to the margin and then
+ * printed 87x "scratch allocation: out of memory" -- the weights were resident
+ * but nothing could compute. So the cushion is now Q38_DENSE_MARGIN_MB,
+ * default 1024, applied to eager AND lazy alike: the two paths must not
+ * disagree about the budget, or a weight that eager refused legitimately
+ * reappears as a mid-forward stall. The cost is honest: with an asymmetric
+ * list the weak card's small reserve stops being dense overflow at all and
+ * stays arena/expert ground, which is where it was always meant to live. */
+static size_t dense_margin(void){
+    static size_t cached=0;
+    if(!cached){
+        const char *e=getenv("Q38_DENSE_MARGIN_MB");
+        int mb=e&&*e?atoi(e):1024;
+        cached=(size_t)(mb<0?0:mb)*1048576;
+    }
+    return cached;
+}
+
 static int dense_pick_device(size_t need){
-    size_t margin=(size_t)256*1024*1024;
+    size_t margin=dense_margin();
     if(DG.pin>=0){
         size_t fr=0,tot=0;
         if(coli_cuda_mem_info(DG.pin,&fr,&tot) && fr>=need+margin) return DG.pin;
