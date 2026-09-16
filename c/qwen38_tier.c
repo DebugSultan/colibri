@@ -1381,6 +1381,16 @@ void q38t_dense_stats(void){
     fprintf(stderr,"[q38dense] calls=%llu rows=%llu resident=%.2f GiB refused=%llu\n",
             (unsigned long long)DG.calls,(unsigned long long)DG.rows,
             DG.bytes/1073741824.0,(unsigned long long)DG.refusals);
+    /* The q38 engine never printed the TC_W4A16 routing counter, so the A/B
+     * with the flag on was blind: "no delta" could not be told apart from
+     * "never fired". This closes that gap for good. */
+    uint64_t calls=0,experts=0,erows=0,tcrows=0; double h2d=0,k=0,d2h=0;
+    coli_cuda_group_stats(&calls,&experts,&erows,&h2d,&k,&d2h);
+    coli_cuda_tc_w4a16_rows(&tcrows);
+    fprintf(stderr,"[q38dense] expert-groups: %llu calls %llu rows, TC_W4A16 %llu/%llu (%.1f%%)\n",
+            (unsigned long long)calls,(unsigned long long)erows,
+            (unsigned long long)tcrows,(unsigned long long)erows,
+            erows?100.0*(double)tcrows/(double)erows:0.0);
 }
 
 #endif /* COLI_CUDA */
