@@ -645,6 +645,24 @@ static int q38_env_bool(const char *name,int default_value) {
     fprintf(stderr,"%s must be exactly 0 or 1\n",name);exit(1);
 }
 
+/* Soglia di adesione alla porta densa, in MiB (Q38_DENSE_MIN_MB, default 4).
+ * In decode ogni matmul sulla porta è un round-trip PCIe con sync (x va su,
+ * y torna giù, S=1): pesi sotto i pochi MiB muovono una frazione trascurabile
+ * dei byte ma pagano il conto pieno di latenza — il router (~0,2 MB) e gli
+ * heads minimi valgono ~4% del traffico denso e decine di chiamate/token. Il
+ * pavimento tiene sulla scheda ciò che è bandwidth-bound e lascia sulla CPU
+ * (gratis, è dove sta già) ciò che è latency-bound. 0 = tutto opt-in, il
+ * comportamento del primo banco. */
+static int64_t q38_dense_min_bytes(void){
+    static int64_t cached=-1;
+    if(cached<0){
+        const char *e=getenv("Q38_DENSE_MIN_MB");
+        int mb=e&&*e?atoi(e):4;
+        cached=(int64_t)(mb<0?0:mb)*1048576;
+    }
+    return cached;
+}
+
 static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
     st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
     if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
@@ -658,12 +676,16 @@ static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
             fprintf(stderr,"%s: invalid BF16 byte count\n",name);exit(1);
         }
         st_read_raw_cap(&m->S,name,weight.data,tensor->nbytes,1);
-        /* Opt-in generale del set denso alla porta GPU: il flag è solo un
-         * memo, l'upload avviene pigro alla prima matmul (q38t_dense_matmul),
-         * quindi pesi mai usati in matmul non consumano VRAM e l'ordine di
-         * primo uso segue l'ordine di traffico (DeltaNet prima, lm_head
-         * dopo). Il gate è env-only e non tocca CUDA: sicuro al load. */
-        if(q38t_dense_enabled()) weight.gpu_dense=1;
+        /* Opt-in del set denso alla porta GPU: il flag è solo un
+         * memo, l'upload avviene pigro alla prima matmul (q38t_dense_matmul)
+         * o eagerly al warmstart (q38_dense_eager), quindi pesi mai usati in
+         * matmul non consumano VRAM e l'ordine di primo uso segue l'ordine di
+         * traffico. Sotto la soglia (q38_dense_min_bytes) il peso resta su
+         * CPU: in decode sarebbe pura latenza PCIe. Il gate è env-only e non
+         * tocca CUDA: sicuro al load. */
+        if(q38t_dense_enabled() &&
+           (int64_t)rows*(int64_t)cols*2 >= q38_dense_min_bytes())
+            weight.gpu_dense=1;
     } else {
         if(tensor->dtype<0||tensor->dtype>2){
             fprintf(stderr,"%s: unsupported resident dtype %s\n",name,st_dtype_name(tensor->dtype));exit(1);
