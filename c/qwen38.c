@@ -1863,6 +1863,9 @@ int main(int argc, char **argv) {
     q38_host_pin_early(&m);
     q38_base_fadvise(&m);
     q38_tier_warmstart(&m);
+    /* Dense eager: after the arena has settled, upload the gated dense set
+     * now instead of letting the first forwards pay it stall by stall. */
+    q38_dense_eager(&m);
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts

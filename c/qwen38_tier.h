@@ -113,6 +113,12 @@ int  q38t_ready(void);
  * must not re-attempt a 1 GiB cudaMalloc on every token. */
 int  q38t_dense_matmul(void **slot, float *y, const float *x, const uint16_t *w,
                        int S, int I, int O);
+/* Eager variant: upload only, no execution. Shares the slot, the sticky
+ * refusal and the byte accounting with the matmul path, so a staged weight
+ * makes the first matmul's upload branch a no-op. Returns 1 when the weight
+ * is on device (already was, or just went), 0 when it must stay on CPU. */
+int  q38t_dense_stage(void **slot, const uint16_t *w, int I, int O);
+uint64_t q38t_dense_bytes(void);
 void q38t_dense_release(void **slot);
 int  q38t_dense_enabled(void);
 void q38t_dense_stats(void);
@@ -215,6 +221,8 @@ void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int));
 static inline int  q38t_init(int a,int b,int c,int d,int e,int f,int g,int h,int i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
 static inline int  q38t_ready(void){return 0;}
 static inline int  q38t_dense_matmul(void**a,float*b,const float*c,const uint16_t*d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  q38t_dense_stage(void**a,const uint16_t*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline uint64_t q38t_dense_bytes(void){return 0;}
 static inline void q38t_dense_release(void**a){(void)a;}
 static inline int  q38t_dense_enabled(void){return 0;}
 static inline void q38t_dense_stats(void){}
