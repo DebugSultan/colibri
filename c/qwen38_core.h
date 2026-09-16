@@ -1549,6 +1549,42 @@ static void q38_base_fadvise(Model *m){
             dropped/1073741824.0);
 }
 
+/* Upload eager del set denso al warmstart (dopo l'assestamento dell'arena):
+ * ogni peso matmul-eligible col gate gpu_dense preso va in VRAM ORA, così il
+ * primo forward non paga 725 upload HtoD sincroni dentro il prefill (il banco
+ * r2048 lo ha mostrato: la via pigra funziona ma costa secondi nascosti nel
+ * TTFT). embed non è nell'elenco — si legge a righe, non si moltiplica: il
+ * fatto che la via pigra non lo chiami mai non autorizza a riempirci la VRAM.
+ * Un rifiuto qui è lo stesso sticky-rifiuto della via pigra: il peso cade su
+ * CPU come è sempre caduto. */
+static int q38_dense_eager(Model *m){
+    if(!q38t_dense_enabled()) return 0;
+    double t0=now_s();
+    int staged=0,fell=0;
+    #define Q38EAGER(w) do{ Q38Weight *W=&(w); \
+        if(W->kind==Q38_WEIGHT_BF16&&W->gpu_dense){ \
+            if(q38t_dense_stage(&W->gpu,(const uint16_t*)W->data,W->cols,W->rows)) staged++; \
+            else fell++; \
+        } }while(0)
+    Q38EAGER(m->lm_head);
+    Q38EAGER(m->final_gr.down);Q38EAGER(m->final_gr.up);Q38EAGER(m->final_gr.inject);
+    for(int l=m->range_begin;l<m->range_end;l++){
+        Layer *L=&m->L[l];
+        Q38EAGER(L->q);Q38EAGER(L->k);Q38EAGER(L->v);Q38EAGER(L->o);
+        Q38EAGER(L->idx_qk);Q38EAGER(L->router);
+        Q38EAGER(L->sh_g);Q38EAGER(L->sh_u);Q38EAGER(L->sh_d);
+        Q38EAGER(L->ple_key);Q38EAGER(L->ple_value);
+        Q38EAGER(L->dn_qkv);Q38EAGER(L->dn_z);Q38EAGER(L->dn_b);
+        Q38EAGER(L->dn_a);Q38EAGER(L->dn_out);
+        Q38EAGER(L->attn_gr.down);Q38EAGER(L->attn_gr.up);Q38EAGER(L->attn_gr.inject);
+        Q38EAGER(L->mlp_gr.down);Q38EAGER(L->mlp_gr.up);Q38EAGER(L->mlp_gr.inject);
+    }
+    #undef Q38EAGER
+    fprintf(stderr,"[q38dense] eager: %d weights staged, %d fell back, %.2f GiB in %.1f s\n",
+            staged,fell,(double)q38t_dense_bytes()/1073741824.0,now_s()-t0);
+    return staged;
+}
+
 static void q38_prefetch_native_fp8_experts(Model *m,int layer,
                                             const int *experts,int count) {
     if(!m->expert_prefetch||!experts||count<1)return;

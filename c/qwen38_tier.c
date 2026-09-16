@@ -1298,6 +1298,47 @@ int q38t_dense_matmul(void **slot, float *y, const float *x, const uint16_t *w,
     return 1;
 }
 
+/* Eager staging: upload a gated weight to VRAM WITHOUT executing anything, so
+ * capacity failures surface at startup (where the log reads them) instead of
+ * as stalls inside the first forwards. Shares the slot, the sticky refusal
+ * and the accounting with the lazy path: a staged weight makes
+ * q38t_dense_matmul's upload branch a no-op, and a refused one falls to CPU
+ * exactly as it always did. */
+int q38t_dense_stage(void **slot, const uint16_t *w, int I, int O){
+    if(!slot || !w || I<1 || O<1) return 0;
+    if(!dense_attach()) return 0;
+
+    Q38TDense *d=(Q38TDense*)*slot;
+    if(!d){
+        d=(Q38TDense*)calloc(1,sizeof *d);
+        if(!d) return 0;
+        d->device=-1;
+        *slot=d;
+    }
+    if(d->refused) return 0;
+    if(d->t) return 1;
+
+    size_t need=(size_t)I*(size_t)O*2;
+    int dev=dense_pick_device(need);
+    if(dev<0){
+        fprintf(stderr,"[q38dense] eager: [%d,%d] bf16 (%.2f GiB) does not fit -> "
+                       "CPU for this weight\n",O,I,need/1073741824.0);
+        d->refused=1; DG.refusals++; return 0;
+    }
+    d->device=dev;
+    if(!coli_cuda_tensor_upload_g(&d->t,w,NULL,9,I,O,dev,0)){
+        fprintf(stderr,"[q38dense] eager: upload of [%d,%d] bf16 failed -> CPU for "
+                       "this weight\n",O,I);
+        if(!d->t) d->device=-1;
+        d->refused=1; DG.refusals++; return 0;
+    }
+    if(!d->counted && d->t){
+        DG.bytes += coli_cuda_tensor_bytes(d->t);
+        d->counted=1;
+    }
+    return 1;
+}
+
 void q38t_dense_release(void **slot){
     if(!slot||!*slot) return;
     Q38TDense *d=(Q38TDense*)*slot;
@@ -1305,6 +1346,8 @@ void q38t_dense_release(void **slot){
     free(d);
     *slot=NULL;
 }
+
+uint64_t q38t_dense_bytes(void){ return (uint64_t)DG.bytes; }
 
 void q38t_dense_stats(void){
     if(DG.attached<=0) return;
