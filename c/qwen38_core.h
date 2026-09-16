@@ -2254,7 +2254,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      * changes inside a position, so the result is bit-identical to the
      * serial path. The scheduling is dynamic because the ranking cost grows
      * with the position (the IK prefix to read is O(pos)). */
-    double qsa_started=now_s(),index_dt=0,attn_dt=0;
+    double index_dt=0,attn_dt=0;
     /* The outer loop parallelises POSITIONS. Decode is one position, so there
      * the outer team is one thread and the two inner loops below take the
      * parallelism instead (guarded if(S==1)) -- one active level in either

@@ -1238,6 +1238,9 @@ tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_qsa_threads$(EXE): tests/test_qwen38_qsa_threads.c qwen38.c qwen38_core.h qwen38_matmul.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_vision$(EXE): tests/test_qwen38_vision.c qwen38_vision.h st.h json.h compat.h
 	$(CC) $(CFLAGS) -Wno-unused-function $< -o $@ $(LDFLAGS)
 
