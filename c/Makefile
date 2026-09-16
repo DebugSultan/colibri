@@ -1094,7 +1094,7 @@ QWEN38_TIER_SRC =
 QWEN38_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN38_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_matmul.h qwen38_tier.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN38_TIER_SRC) $(CUDA_OBJ)
+qwen38$(EXE): qwen38.c cli_args.h omp_tune.h qwen38_core.h qwen38_matmul.h qwen38_tier.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok.h tok_unicode.h tok_unicode_o200k.h serve_codec.h edge_adapter_internal.h edge_adapters.h edge_runtime.h qwen38_vision.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN38_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN38_CFLAGS) qwen38.c $(QWEN38_TIER_SRC) $(CUDA_OBJ) -o qwen38$(EXE) $(QWEN38_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
@@ -1103,6 +1103,20 @@ qwen38$(EXE): qwen38.c cli_args.h qwen38_core.h qwen38_matmul.h qwen38_tier.h qw
 deepseek_v41$(EXE): deepseek_v41.c cli_args.h st.h json.h tok.h tok_unicode.h compat.h quant.h \
 	sparse_attn.h hyper_connections.h serve_codec.h serve_poll.h .build-config
 	$(CC) $(CFLAGS) deepseek_v41.c -o deepseek_v41$(EXE) $(LDFLAGS)
+
+# fmt=9 dense per-call cost oracle. NOT part of cuda-test: it is a measurement,
+# not a correctness check -- it allocates up to ~1.2 GiB for the lm_head shape
+# and its numbers are only meaningful on an otherwise idle card. It fits
+# t = a + b*(I*O) + c*O over the real checkpoint shapes plus probes chosen to
+# make the fit identifiable, which splits the ~89 ms/token of dense cost that
+# is NOT bandwidth into the part CUDA graphs can remove (a), the irreducible
+# weight read (b), and the part a warp-level fmt=9 kernel would remove (c).
+# This target only BUILDS, so it is usable while the cards are busy; run
+# ./dense_cost_bench separately when a card is free.
+.PHONY: dense-cost-bench
+dense-cost-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_dense_cost.cu
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_dense_cost.cu -o dense_cost_bench$(EXE)
+	@echo "built dense_cost_bench -- run it on a free card, COLI_DENSE_BENCH_DEV=0 is the 5070 Ti"
 
 .PHONY: qwen38-tiny-generate qwen38-tiny-check
 qwen38-tiny-generate:
