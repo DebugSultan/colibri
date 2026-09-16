@@ -61,7 +61,12 @@ typedef struct {
     int64_t elements, scale_count;
     Q38WeightKind kind;
     int gs;                        /* Q38_WEIGHT_I4 only */
+    /* Device-side copy of this weight, owned by the tier and opaque here.
+     * Only BF16 weights marked gpu_dense take it; everything else leaves it
+     * NULL and the dispatcher below never looks at it. */
+    void *gpu;
     unsigned owns_data:1, owns_scales:1;
+    unsigned gpu_dense:1;          /* opted in to the GPU dense path */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -219,6 +224,7 @@ static float *falloc(int64_t n) {
 
 static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
+    if(weight->gpu)q38t_dense_release(&weight->gpu);
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
     memset(weight,0,sizeof(*weight));
@@ -292,6 +298,15 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     if(weight->kind==Q38_WEIGHT_F32){
         q38_matmul(y,x,(const float*)weight->data,S,I,O);
     }else if(weight->kind==Q38_WEIGHT_BF16){
+        /* The GPU takes this weight only if it was opted in AND the tier
+         * accepted its residency; every refusal (no VRAM, no device, the env
+         * off) falls through to the very CPU kernels below, unchanged. The
+         * cache pointer is a memo about the weight, not a change to it, which
+         * is why a const view is allowed to fill it in. */
+        if(weight->gpu_dense &&
+           q38t_dense_matmul(&((Q38Weight*)weight)->gpu,y,x,
+                             (const uint16_t*)weight->data,S,I,O))
+            return;
 #ifdef __AVX2__
         if(q38_simd_matmul()){
             q38_matmul_bf16_avx2(y,x,(const uint16_t*)weight->data,S,I,O);
@@ -887,6 +902,12 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     if(load_boundaries){
         snprintf(nm,sizeof nm,"%s.embed_tokens.weight",m->prefix); m->embed=q38_load_weight(m,nm,c->vocab,c->hidden);
         m->lm_head=q38_load_weight(m,"lm_head.weight",c->vocab,c->hidden);
+        /* First dense weight routed to the GPU: one bf16 tensor, one call per
+         * token, 14.5% of the dense byte budget, and no coupling whatsoever to
+         * the layer loop -- which makes it the only clean A/B available before
+         * the DeltaNet projections (47.5%) follow the same door. */
+        if(m->lm_head.kind==Q38_WEIGHT_BF16 && q38t_dense_enabled())
+            m->lm_head.gpu_dense=1;
         q38_load_gr(m,&m->final_gr,-1,NULL,0);
     }
     m->L=(Layer*)calloc((size_t)c->layers,sizeof(Layer));
@@ -2666,6 +2687,10 @@ static void q38_model_free(Model *m) {
         }
         q38t_stats(); q38t_shutdown(); m->tier=0;
     }
+    /* Reported outside the tier block on purpose: the dense GPU path does not
+     * need the expert tier to have attached, so its counters must print on a
+     * run where m->tier is 0. */
+    q38t_dense_stats();
     for(int i=0;i<m->c.layers;i++) {
         if(m->L)q38_layer_free(&m->L[i]);
         if(m->cache) {

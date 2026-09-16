@@ -47,7 +47,7 @@ extern "C" {
  * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
  * decode through. */
 static inline int coli_cuda_weight_at_supported(int fmt) {
-    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4;
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4 || fmt == 9;
 }
 
 /* Opaque, persistent device copy of one resident quantized tensor. */
@@ -110,7 +110,11 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tens
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4.
+ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4,
+ * plus 9=bf16, which this backend adds because the qwen38 dense side (attention
+ * projections, DeltaNet in/out, gated residual, shared expert, router, lm_head)
+ * is bf16 end to end and carries no scales. It rides the generic weight_at
+ * branch: no scale buffer, no new kernel.
  * gs is the group size for fmt=4 (0 for all other formats).
  * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.

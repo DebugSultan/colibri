@@ -171,8 +171,19 @@ static int select_ctx(DeviceContext *ctx) {
 #define COLI_E8_SUB      32
 #define COLI_E8_BBYTES   98
 
+/* Formats with no separate scale buffer: fmt=0 (f32) and fmt=9 (bf16) carry
+ * their magnitude in the weights themselves, fmt=6 keeps its scales inside each
+ * block. None of them has a scale array to allocate, upload, charge against the
+ * device budget or refresh -- the rule lives here so the six call sites that
+ * used to spell out `fmt && fmt != 6` cannot drift apart. */
+__host__ __device__ static int fmt_scale_free(int fmt) {
+    return fmt == 0 || fmt == 6 || fmt == 9;
+}
+
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 0) return (size_t)I * sizeof(float);
+    if (fmt == 9) return (size_t)I * 2;         /* bf16: the dense side of the
+                                                 * checkpoint is bf16 end to end */
     if (fmt == 1) return (size_t)I;
     if (fmt == 2 || fmt == 4) return (size_t)(I + 1) / 2;   /* fmt=4: same packed int4 */
     if (fmt == 3) return (size_t)(I + 3) / 4;
@@ -306,6 +317,11 @@ __device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
+    /* bf16 -> f32 is the identity on the top 16 bits: no rounding, no table, no
+     * cuda_bf16.h dependency. Every bf16 value (subnormals, inf, NaN) maps to
+     * the f32 with the same sign/exponent and a zeroed mantissa tail, which is
+     * exactly what the CPU q38_matmul_bf16 reference does. */
+    if (fmt == 9) return __uint_as_float((uint32_t)reinterpret_cast<const uint16_t *>(base)[i] << 16);
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
     const uint8_t *q = base;
     if (fmt == 2 || fmt == 4) {                               /* fmt=4: same nibble layout */
@@ -326,7 +342,9 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
  * attention absorb kernels apply per-group scales instead of the per-row
  * (fmt=2) semantic that crashed #298's g64 kv_b. */
 __device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
-    if (!fmt) return 1.f;
+    /* Scale-free formats carry no `wscale` buffer at all (it is NULL), so this
+     * must short-circuit for every one of them, not just fmt=0. */
+    if (fmt_scale_free(fmt)) return 1.f;
     if (fmt != 4) return wscale[row];
     int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
     return wscale[(size_t)row * ng + g];
@@ -564,8 +582,12 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * block header, 8 reads a per-128 block scale alongside the weights.
          * Only the per-row formats get the trailing multiply --
          * and for fmt=7 `scales` points at ue8m0 BYTES, so reading it as float
-         * here does not merely double-scale, it reads garbage. */
-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
+         * here does not merely double-scale, it reads garbage.
+         * The scale-free formats (0, 6, 9) are excluded through the shared
+         * predicate: `scales` is NULL for them, so a trailing multiply is not a
+         * numerical error but a null dereference. Same truth table as the old
+         * `fmt && fmt != 6` spelling for every fmt a container carries. */
+        y[(size_t)s * O + o] = (!fmt_scale_free(fmt) && fmt != 4 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
 }
 
 /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
@@ -1412,7 +1434,7 @@ static int tensor_fill_desc(ColiCudaTensor *t, int fmt, int I, int O, int device
         t->ng = (I + 127) / 128;
         t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
     }
-    if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
+    if (fmt_scale_free(fmt)) t->scale_count = 0;   /* nothing separate to track */
     return 1;
 }
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
@@ -1431,7 +1453,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    if (!row_bytes(fmt, I) || (fmt && fmt != 6 && !scales)) return 0;
+    if (!row_bytes(fmt, I) || (!fmt_scale_free(fmt) && !scales)) return 0;
     if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t || !tensor_fill_desc(t, fmt, I, O, device)) { std::free(t); return 0; }
@@ -1450,7 +1472,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
-    if (fmt && fmt != 6) {
+    if (!fmt_scale_free(fmt)) {
         if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
@@ -1460,7 +1482,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (!fmt_scale_free(fmt) ? t->scale_count * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -1484,7 +1506,7 @@ extern "C" int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor,
     if (!tensor || *tensor || !weights || !dev_weights || !dev_scales) return 0;
     DeviceContext *ctx = find_ctx(device);
     if (I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    if (fmt && fmt != 6 && !scales) return 0;
+    if (!fmt_scale_free(fmt) && !scales) return 0;
     if (fmt == 8 && !g_fp8_lut_ready) return 0;
     g_upload_gs = gs>0 ? gs : 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
@@ -1499,7 +1521,7 @@ extern "C" int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor,
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){std::free(t);return 0;}}
-    if (fmt && fmt != 6) {
+    if (!fmt_scale_free(fmt)) {
         if (!cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "arena scale upload")) {
             std::free(t);
             return 0;
@@ -1507,7 +1529,7 @@ extern "C" int coli_cuda_tensor_upload_into(ColiCudaTensor **tensor,
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (!fmt_scale_free(fmt) ? t->scale_count * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -1673,7 +1695,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
+    if (!tensor || !weights || (!fmt_scale_free(tensor->fmt) && !scales)) return 0;
 #ifdef COLI_ANS
     if(tensor->compressed) return 0;
 #endif
@@ -1686,9 +1708,9 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
-     * the fallback below would otherwise copy O floats out of a NULL host pointer. */
-    return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
+    /* Scale-free formats have no scale buffer at all (scale_count 0), and the
+     * fallback below would otherwise copy O floats out of a NULL host pointer. */
+    return fmt_scale_free(tensor->fmt) || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
         cudaMemcpyHostToDevice),"scale refresh");
 }
@@ -2463,7 +2485,7 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+            (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2487,7 +2509,7 @@ extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
 #endif
         tensor->weight_bytes;
     return storage_bytes +
-        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
+        (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 /* What a cudaMalloc of `bytes` actually takes off the card.
@@ -2600,7 +2622,7 @@ extern "C" size_t coli_cuda_tensor_vram(const ColiCudaTensor *tensor) {
 #endif
         tensor->weight_bytes;
     size_t total = coli_cuda_alloc_footprint(storage_bytes);
-    if (tensor->fmt && tensor->fmt != 6)
+    if (!fmt_scale_free(tensor->fmt))
         total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
     return total;
 }

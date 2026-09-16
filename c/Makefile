@@ -951,6 +951,13 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# file is compiled.
 	"$(GPUCC)" $(GPUFLAGS) tests/test_w4a16_g4_cuda.cu -o w4a16_g4_test$(EXE)
 	./w4a16_g4_test$(EXE)
+	# fmt=9 (bf16): exhaustive bit-exact decode over all 65536 patterns, GEMM
+	# parity against the same bf16_to_f32 the CPU dense paths use, and the
+	# scale-free contract (NULL scales accepted, zero scale bytes charged)
+	# with a fmt=1 negative control so the widened guard cannot just be gone.
+	# Includes backend_cuda.cu itself, so only the test file is compiled.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_bf16_cuda.cu -o bf16_cuda_test$(EXE)
+	./bf16_cuda_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
