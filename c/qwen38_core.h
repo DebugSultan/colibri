@@ -645,6 +645,24 @@ static int q38_env_bool(const char *name,int default_value) {
     fprintf(stderr,"%s must be exactly 0 or 1\n",name);exit(1);
 }
 
+/* Join threshold for the dense GPU port, in MiB (Q38_DENSE_MIN_MB, default
+ * 4). In decode every matmul on the port is a PCIe round-trip with a sync
+ * (x up, y back down, S=1): weights below a few MiB move a negligible
+ * fraction of the bytes but pay the full latency bill - the router (~0.2 MB)
+ * and the smallest heads are ~4% of the dense traffic and tens of calls per
+ * token. The floor keeps on the card what is bandwidth-bound and leaves on
+ * the CPU (for free, it is already there) what is latency-bound. 0 = every
+ * weight opts in, the original behaviour. */
+static int64_t q38_dense_min_bytes(void){
+    static int64_t cached=-1;
+    if(cached<0){
+        const char *e=getenv("Q38_DENSE_MIN_MB");
+        int mb=e&&*e?atoi(e):4;
+        cached=(int64_t)(mb<0?0:mb)*1048576;
+    }
+    return cached;
+}
+
 static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
     st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
     if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
