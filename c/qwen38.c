@@ -1857,10 +1857,12 @@ int main(int argc, char **argv) {
     g_capture_last_logit=ref_logits!=NULL||getenv("DUMP")!=NULL;
     q38_telemetry_init(snap, &m);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
-    /* Only here and not in the Segment adapter: that one opens with cap=1
-     * and resizes afterwards, and a singleton tier inside a multi-model
-     * context is a decision in itself. Without HEAT_FILE this call reads
-     * nothing. */
+    /* Solo qui e non nell'adattatore Segment: quello apre con cap=1
+     * e si ridimensiona dopo, e un tier singleton dentro un contesto
+     * multi-modello è una decisione in sé. Senza HEAT_FILE questa chiamata
+     * non legge nulla. */
+    q38_host_pin_early(&m);
+    q38_base_fadvise(&m);
     q38_tier_warmstart(&m);
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
