@@ -2254,18 +2254,27 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      * al path seriale. Lo scheduling e' dynamic perche' il costo del ranking
      * cresce con la posizione (il prefisso IK da leggere e' O(pos)). */
     double qsa_started=now_s(),index_dt=0,attn_dt=0;
-    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt)
+    /* The outer loop parallelises POSITIONS. Decode is one position, so there
+     * the outer team is one thread and the two inner loops below take the
+     * parallelism instead (guarded if(S==1)) -- one active level in either
+     * mode, no nested teams, no oversubscription games. */
+    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
     for(int s=0;s<S;s++){
         int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
         double phase_started=now_s();
-        float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
+        float *qidx=falloc((int64_t)IQ*ID);
         int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
         if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
         for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,c->theta);}
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
+        /* Blocks are independent: rank[] writes are disjoint and the pool is
+         * pure per-block scratch, so per-b FP order is untouched and the
+         * result is bit-identical to the serial loop. */
+        #pragma omp parallel for schedule(static) if(S==1)
         for(int b=0;b<blocks;b++){
+            float pool[ID];
             memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
             q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,c->theta);
             float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
@@ -2274,6 +2283,13 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
         for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
         index_dt+=now_s()-phase_started; phase_started=now_s();
+        /* Same argument as the block loop, one level up in the data: every h
+         * touches only its own heads[s,h] row, the scratch is per-iteration
+         * (malloc is thread-safe), K/V and selected[] are read-only here, and
+         * no FP addition crosses heads. Bit-identical, and this is where
+         * decode's 117 ms/token actually lives: one core doing 24 heads of
+         * 2048 gathered rows. */
+        #pragma omp parallel for schedule(static) if(S==1)
         for(int h=0;h<QH;h++){
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
             float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,c->theta);
@@ -2285,7 +2301,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
         }
         attn_dt+=now_s()-phase_started;
-        free(qidx);free(pool);free(selected);
+        free(qidx);free(selected);
     }
     #pragma omp critical
     {
