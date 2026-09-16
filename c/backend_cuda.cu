@@ -1820,6 +1820,49 @@ static void quant_matmul_launch(float *y, const float *x, const void *w,
         quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
 }
 
+/* Stage split of the dense call, under COLI_CUDA_PROFILE and only at S==1:
+ * the oracle put the same call at ~70 us on a free card against the engine's
+ * ~550 us, and only a split taken inside a live run can say where those
+ * 480 us went -- submission (launch return), execution (kernel event span),
+ * or the host side of the downloads. Everything dense rides is the legacy
+ * default stream (quant_matmul_launch takes no stream argument), so events
+ * recorded on stream 0 bracket the call itself and never the tier work
+ * queued on the nonblocking ctx->stream -- the same fact that makes this
+ * split trustworthy also retires the "dense absorbs the tier" story.
+ * Events are created and destroyed per call, the exact shape and the exact
+ * distortion of the group profile path; wall segments cost four clock reads.
+ * Decode only, because prefill calls are legitimately milliseconds long and
+ * would drown the split. One forward thread makes these calls, so plain
+ * statics are enough. */
+static double mm_now_ms(){
+    using clk=std::chrono::steady_clock;
+    return std::chrono::duration<double,std::milli>(clk::now().time_since_epoch()).count();
+}
+static uint64_t g_mm_trace_n;
+static double g_mm_trace_up,g_mm_trace_h2d,g_mm_trace_launch,g_mm_trace_down;
+static double g_mm_trace_ev_h2d,g_mm_trace_ev_kern,g_mm_trace_ev_d2h;
+static double g_mm_trace_max_launch,g_mm_trace_max_down,g_mm_trace_max_kern;
+
+extern "C" void coli_cuda_mm_trace(uint64_t *n,double *wall_us,double *ev_us,double *max_us){
+    if(n)*n=g_mm_trace_n;
+    if(wall_us&&g_mm_trace_n){
+        wall_us[0]=g_mm_trace_up*1e3/g_mm_trace_n;   /* upload memoization, host */
+        wall_us[1]=g_mm_trace_h2d*1e3/g_mm_trace_n;  /* input upload call, host */
+        wall_us[2]=g_mm_trace_launch*1e3/g_mm_trace_n;
+        wall_us[3]=g_mm_trace_down*1e3/g_mm_trace_n;
+    }
+    if(ev_us&&g_mm_trace_n){
+        ev_us[0]=g_mm_trace_ev_h2d*1e3/g_mm_trace_n;
+        ev_us[1]=g_mm_trace_ev_kern*1e3/g_mm_trace_n;
+        ev_us[2]=g_mm_trace_ev_d2h*1e3/g_mm_trace_n;
+    }
+    if(max_us){   /* worst single call, us: spikes are the story half the time */
+        max_us[0]=g_mm_trace_max_launch*1e3;
+        max_us[1]=g_mm_trace_max_down*1e3;
+        max_us[2]=g_mm_trace_max_kern*1e3;
+    }
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
@@ -1831,6 +1874,17 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
      * the CPU (#298, #334). */
     if (fmt == 4 && gs <= 0) return 0;
     if (S < 1) return 0;
+    int prof = (S == 1) && getenv("COLI_CUDA_PROFILE") && atoi(getenv("COLI_CUDA_PROFILE"));
+    cudaEvent_t ev[4];
+    double w0=0,w1=0,w2=0,w3=0,w4=0;
+    if (prof) {
+        for (int i=0;i<4;i++)
+            if (cudaEventCreate(&ev[i]) != cudaSuccess) {
+                for (int j=0;j<i;j++) cudaEventDestroy(ev[j]);
+                prof=0; break;
+            }
+    }
+    if (prof) w0 = mm_now_ms();
     if (gs > 0) { if (!coli_cuda_tensor_upload_g(tensor, weights, scales, fmt, I, O, device, gs)) return 0; }
     else        { if (!coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0; }
     ColiCudaTensor *t = *tensor;
@@ -1839,10 +1893,37 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
-    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    if (prof) { w1 = mm_now_ms(); cudaEventRecord(ev[0], nullptr); }
+    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) {
+        if (prof) for (int i=0;i<4;i++) cudaEventDestroy(ev[i]);
+        return 0;
+    }
+    if (prof) { w2 = mm_now_ms(); cudaEventRecord(ev[1], nullptr); }
     quant_matmul_launch(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
-    if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    cudaError_t le = cudaGetLastError();
+    if (prof) { w3 = mm_now_ms(); cudaEventRecord(ev[2], nullptr); }
+    if (!cuda_ok(le, "matmul launch") ||
+        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) {
+        if (prof) for (int i=0;i<4;i++) cudaEventDestroy(ev[i]);
+        return 0;
+    }
+    if (prof) {
+        w4 = mm_now_ms(); cudaEventRecord(ev[3], nullptr);
+        if (cudaEventSynchronize(ev[3]) == cudaSuccess) {
+            float a=0,b=0,c=0;
+            cudaEventElapsedTime(&a, ev[0], ev[1]);   /* input upload, device */
+            cudaEventElapsedTime(&b, ev[1], ev[2]);   /* kernel, including start delay */
+            cudaEventElapsedTime(&c, ev[2], ev[3]);   /* output download, device */
+            g_mm_trace_n++;
+            g_mm_trace_up+=w1-w0; g_mm_trace_h2d+=w2-w1;
+            g_mm_trace_launch+=w3-w2; g_mm_trace_down+=w4-w3;
+            g_mm_trace_ev_h2d+=a; g_mm_trace_ev_kern+=b; g_mm_trace_ev_d2h+=c;
+            if (w3-w2 > g_mm_trace_max_launch) g_mm_trace_max_launch = w3-w2;
+            if (w4-w3 > g_mm_trace_max_down)   g_mm_trace_max_down   = w4-w3;
+            if (b     > g_mm_trace_max_kern)   g_mm_trace_max_kern   = b;
+        }
+        for (int i=0;i<4;i++) cudaEventDestroy(ev[i]);
+    }
     return 1;
 }
 

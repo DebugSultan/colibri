@@ -1392,6 +1392,19 @@ void q38t_dense_stats(void){
             (unsigned long long)calls,(unsigned long long)erows,
             (unsigned long long)tcrows,(unsigned long long)erows,
             erows?100.0*(double)tcrows/(double)erows:0.0);
+    /* The oracle's answer did not carry the ~480 us/call the engine pays at
+     * S=1, and none of its candidate explanations survived measurement:
+     * decode clocks run hot, host CPU saturation adds 1.5 us/call, and the
+     * dense stream is legacy-default while the tier's is nonblocking, so no
+     * queued work can hide inside the call either. This line is where that
+     * residue gets a shape: submission (launch return), execution (kernel
+     * event span), or host download. */
+    uint64_t tn=0; double wall[4]={0,0,0,0},mev[3]={0,0,0},mx[3]={0,0,0};
+    coli_cuda_mm_trace(&tn,wall,mev,mx);
+    if(tn)fprintf(stderr,"[q38dense] mm trace S=1 %llu calls: up %.1f h2d %.1f launch %.1f down %.1f us/call"
+                         " | dev h2d %.1f kern %.1f d2h %.1f | max launch %.0f down %.0f kern %.0f us\n",
+            (unsigned long long)tn,wall[0],wall[1],wall[2],wall[3],
+            mev[0],mev[1],mev[2],mx[0],mx[1],mx[2]);
 }
 
 #endif /* COLI_CUDA */

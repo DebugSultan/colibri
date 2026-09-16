@@ -80,6 +80,12 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats_device(
     double *h2d_ms, double *kernel_ms, double *d2h_ms);
 /* Rows served by the W4A16 Tensor Core branch (routing oracle for TC_W4A16). */
 COLI_CUDA_DLLEXPORT void coli_cuda_tc_w4a16_rows(uint64_t *rows);
+/* Stage split of the dense call (coli_cuda_matmul at S==1) taken under
+ * COLI_CUDA_PROFILE: wall_us = upload memoization, input upload, launch
+ * return, output download (us/call); ev_us = device-side h2d, kernel
+ * including start delay, d2h (us/call); max_us = worst single call of
+ * launch return, output download, kernel span (us). n=0 when never traced. */
+COLI_CUDA_DLLEXPORT void coli_cuda_mm_trace(uint64_t *n,double *wall_us,double *ev_us,double *max_us);
 
 /* Publish the E8 codebook (quant.h's e8_grid, 256x4 bytes) to every configured
  * device. Must be called after coli_cuda_init and before any fmt=6 upload; the
