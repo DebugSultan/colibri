@@ -2269,10 +2269,10 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
         if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
-        /* Blocks are independent: rank[] writes are disjoint and the pool is
-         * pure per-block scratch, so per-b FP order is untouched and the
-         * result is bit-identical to the serial loop. */
-        #pragma omp parallel for schedule(static) if(S==1)
+        /* NOT parallel even at decode: measured S=1 x20 threads made this
+         * phase 30.3 -> 36.7 ms/token. The scan walks IK rows in position
+         * order and the hardware prefetcher is worth more than the 20 extra
+         * cores; the heads loop below is where decode's parallelism pays. */
         for(int b=0;b<blocks;b++){
             float pool[ID];
             memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=m->IK[layer]+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
