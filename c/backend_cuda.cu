@@ -1418,6 +1418,20 @@ extern "C" int coli_cuda_device_profile(int device, int *sm, int *pcie_width) {
     return 1;
 }
 
+/* Device name (e.g. "NVIDIA GeForce RTX 5070 Ti") for operator-visible logs.
+ * CUDA enumerates fastest-first, which is NOT nvidia-smi's PCI order on a mixed
+ * machine: any line that shows a device id without a name asks the reader to
+ * guess the index space, and a wrong guess inverts the meaning of a per-device
+ * setting. 0 with out emptied if the properties cannot be read. */
+extern "C" int coli_cuda_device_name(int device, char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = '\0';
+    cudaDeviceProp prop{};
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
+    snprintf(out, cap, "%s", prop.name);
+    return 1;
+}
+
 /* #653: 1 when the device shares physical memory with the host (Grace-Blackwell /
  * GB10, Jetson, integrated GPUs). On these the expert tier and the RAM cache draw
  * from the same pool, so the RAM budget must account for the tier; on a discrete GPU

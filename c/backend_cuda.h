@@ -68,6 +68,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_
  * card's maximum: a card can sit in a slot wired narrower than itself. Either
  * output pointer may be NULL. Returns 0 if the device properties cannot be read. */
 COLI_CUDA_DLLEXPORT int coli_cuda_device_profile(int device, int *sm, int *pcie_width);
+COLI_CUDA_DLLEXPORT int coli_cuda_device_name(int device, char *out, size_t cap);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
