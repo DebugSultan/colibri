@@ -979,7 +979,16 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     ensure_kv(m);
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
+    /* Prefill and decode are bottlenecked by opposite things: prefill batches
+     * rows and amortizes every weight read across the batch, while decode reads
+     * the whole dense resident set to serve ONE row.  A single bank averages the
+     * two into a number that describes neither, so snapshot the counters around
+     * the prompt forward and report the phases apart.  The totals still print
+     * from tm_report(); prefill + decode + warmstart must reconcile with it. */
+    Q38Timers tm_before_prefill = m->timers;
     float *logit = step(m, prompt, np, 0);
+    Q38Timers tm_prefill = q38_tm_delta(&m->timers, &tm_before_prefill);
+    Q38Timers tm_before_decode = m->timers;
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = 0; float bv = logit[0];
@@ -999,6 +1008,11 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         free(logit); out[len++] = best;
         int one = best;
         logit = step(m, &one, 1, len - 1);
+    }
+    {
+        Q38Timers tm_decode = q38_tm_delta(&m->timers, &tm_before_decode);
+        q38_tm_report_bank(&tm_prefill, "prefill");
+        q38_tm_report_bank(&tm_decode, "decode");
     }
 }
 
