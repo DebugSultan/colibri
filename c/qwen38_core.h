@@ -658,6 +658,16 @@ static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
             fprintf(stderr,"%s: invalid BF16 byte count\n",name);exit(1);
         }
         st_read_raw_cap(&m->S,name,weight.data,tensor->nbytes,1);
+        /* Opting the dense set into the GPU port: the flag is only a memo,
+         * the upload happens lazily on the first matmul (q38t_dense_matmul)
+         * or eagerly at warmstart (q38_dense_eager), so weights never used in
+         * a matmul consume no VRAM and the first-use order follows the order
+         * of the traffic. Below the threshold (q38_dense_min_bytes) the
+         * weight stays on the CPU: in decode it would be pure PCIe latency.
+         * The gate is env-only and does not touch CUDA: safe at load. */
+        if(q38t_dense_enabled() &&
+           (int64_t)rows*(int64_t)cols*2 >= q38_dense_min_bytes())
+            weight.gpu_dense=1;
     } else {
         if(tensor->dtype<0||tensor->dtype>2){
             fprintf(stderr,"%s: unsupported resident dtype %s\n",name,st_dtype_name(tensor->dtype));exit(1);
@@ -902,12 +912,6 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     if(load_boundaries){
         snprintf(nm,sizeof nm,"%s.embed_tokens.weight",m->prefix); m->embed=q38_load_weight(m,nm,c->vocab,c->hidden);
         m->lm_head=q38_load_weight(m,"lm_head.weight",c->vocab,c->hidden);
-        /* First dense weight routed to the GPU: one bf16 tensor, one call per
-         * token, 14.5% of the dense byte budget, and no coupling whatsoever to
-         * the layer loop -- which makes it the only clean A/B available before
-         * the DeltaNet projections (47.5%) follow the same door. */
-        if(m->lm_head.kind==Q38_WEIGHT_BF16 && q38t_dense_enabled())
-            m->lm_head.gpu_dense=1;
         q38_load_gr(m,&m->final_gr,-1,NULL,0);
     }
     m->L=(Layer*)calloc((size_t)c->layers,sizeof(Layer));
@@ -1424,10 +1428,11 @@ static int q38_host_pin_on(void){
  * callbacks idempotent: an mlock on an already locked range is a kernel
  * no-op, never an error. */
 static void q38_host_pin_expert(int layer,int expert,int lock){
-    if(!g_pin_model||!g_pin_map) return;
+    if(!g_pin_model) return;
     size_t i=(size_t)layer*g_pin_model->c.experts+expert;
-    unsigned char *flag=&g_pin_map[i];
+    unsigned char *flag=g_pin_map?&g_pin_map[i]:NULL;
     if(lock){
+        if(!flag) return;
         if(__atomic_load_n(flag,__ATOMIC_RELAXED)) return;
         if(!g_pin_model->int4_active) return;
         st_tensor *weight[2];
@@ -1443,7 +1448,7 @@ static void q38_host_pin_expert(int layer,int expert,int lock){
         }
         if(ok) __atomic_store_n(flag,(unsigned char)1,__ATOMIC_RELAXED);
     }else{
-        int locked=__atomic_load_n(flag,__ATOMIC_RELAXED);
+        int locked=flag?__atomic_load_n(flag,__ATOMIC_RELAXED):0;
         st_tensor *weight[2];
         if(!q38_int4_expert_tensors(g_pin_model,layer,expert,weight)) return;
         for(int k=0;k<2;k++){
@@ -1467,7 +1472,7 @@ static void q38_host_pin_expert(int layer,int expert,int lock){
                 posix_fadvise(t->fd,(off_t)t->off,(off_t)t->nbytes,POSIX_FADV_DONTNEED);
 #endif
         }
-        __atomic_store_n(flag,(unsigned char)0,__ATOMIC_RELAXED);
+        if(flag)__atomic_store_n(flag,(unsigned char)0,__ATOMIC_RELAXED);
     }
 }
 static void q38_pin_cb_lock(int l,int e){ q38_host_pin_expert(l,e,1); }
@@ -1510,6 +1515,43 @@ static void q38_host_pin_setup(Model *m,int warmstarted){
             experts,w/1073741824.0,now_s()-t0,
             __atomic_load_n(&g_pin_failed,__ATOMIC_RELAXED)!=failed0
               ?" — some ranges FAILED (memory): the residue stays on page cache":"");
+}
+
+/* Early setup (called BEFORE the warmstart): registers the model, the
+ * callbacks and the map, so that the unlocks the uploader thread performs at
+ * the end of an upload also cover the warmstart's initial uploads, not only
+ * the swap-ins. Without this, ~29 GB of dead page cache builds up during the
+ * upload and its slow eviction pushes cold anonymous memory into zram while
+ * pinning. The universe pass stays in q38_host_pin_setup: residency is final
+ * only after q38t_fill_wait. */
+static void q38_host_pin_early(Model *m){
+    if(g_pin_model||!q38_host_pin_on()) return;
+    g_pin_model=m;
+    q38t_set_host_pin(q38_pin_cb_lock,q38_pin_cb_unlock);
+    if(!g_pin_map){
+        g_pin_map=calloc((size_t)m->c.layers*m->c.experts,1);
+        if(!g_pin_map){ fprintf(stderr,"[HOST-TIER] OOM on the pin map — disabled\n"); return; }
+    }
+}
+
+/* With int4 active the fp8 base is dead after the load: the dense tensors
+ * are malloc copies, the experts come from the int4-gs container and
+ * MTP/vision are never read. DONTNEED over the whole base drops ~11 GiB of
+ * unusable cache before the pinning pass (clean pages would refault from
+ * disk if anything really wanted them, which nothing does). */
+static void q38_base_fadvise(Model *m){
+    if(!m->int4_active) return;
+    long dropped=0;
+    for(int i=0;i<m->S.n;i++){
+        st_tensor *t=&m->S.t[i];
+        if(t->fd<0||t->nbytes<=0) continue;
+#ifndef _WIN32
+        if(posix_fadvise(t->fd,(off_t)t->off,(off_t)t->nbytes,POSIX_FADV_DONTNEED)==0)
+#endif
+            dropped+=(long)t->nbytes;
+    }
+    fprintf(stderr,"[HOST-TIER] base fp8 sources dropped: %.2f GB of dead cache\n",
+            dropped/1073741824.0);
 }
 
 static void q38_prefetch_native_fp8_experts(Model *m,int layer,
