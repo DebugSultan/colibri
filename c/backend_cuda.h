@@ -62,6 +62,12 @@ COLI_CUDA_DLLEXPORT int coli_cuda_available_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+/* Capability profile for placement decisions: SM count (compute) and NEGOTIATED
+ * PCIe link width (upload bandwidth), the latter read from sysfs because the
+ * runtime exposes no attribute for it. The width the link trained to, not the
+ * card's maximum: a card can sit in a slot wired narrower than itself. Either
+ * output pointer may be NULL. Returns 0 if the device properties cannot be read. */
+COLI_CUDA_DLLEXPORT int coli_cuda_device_profile(int device, int *sm, int *pcie_width);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_integrated(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);

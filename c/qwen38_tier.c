@@ -149,13 +149,32 @@ static void arena_give(int di, uint32_t idx){
     G.slot_free[di][G.slot_free_n[di]++]=idx;
 }
 
-/* Reserve in bytes: Q38T_DEV_RESERVE_MB (MiB), default Q38T_DEV_RESERVE.
- * Read on every q38t_init -- once per process in production -- so tests can
- * flip the env between inits without a reset hook. */
-static size_t dev_reserve(void){
+/* Reserve in bytes for one device: Q38T_DEV_RESERVE_MB (MiB), default
+ * Q38T_DEV_RESERVE. Read on every q38t_init -- once per process in production
+ * -- so tests can flip the env between inits without a reset hook.
+ *
+ * The env takes either one value, which applies to every card exactly as it
+ * always did, or a comma list indexed BY DEVICE ID: "1024,6144" leaves 1 GiB
+ * free on dev0 and 6 GiB on dev1. The asymmetric form exists because the cards
+ * are not equal and neither is the work: the expert arena fills both cards at
+ * warmstart while the dense tensors upload lazily on first use, so whatever the
+ * arena takes, the dense set never sees. A larger reserve on the strong card is
+ * how you hand that card to the dense path without starving the weak one of
+ * experts. A device id past the end of the list falls back to the default. */
+static size_t dev_reserve_for(int device){
     const char *m=getenv("Q38T_DEV_RESERVE_MB");
-    double mb=(m && *m) ? atof(m) : 0.0;
-    if(mb>0) return (size_t)(mb*1024.0*1024.0);
+    if(!m || !*m) return Q38T_DEV_RESERVE;
+    if(!strchr(m,',')){
+        double mb=atof(m);
+        return mb>0 ? (size_t)(mb*1024.0*1024.0) : Q38T_DEV_RESERVE;
+    }
+    char buf[128]; snprintf(buf,sizeof buf,"%s",m);
+    int idx=0;
+    for(char *t=strtok(buf,","); t; t=strtok(NULL,","), idx++){
+        if(idx!=device) continue;
+        double mb=atof(t);
+        return mb>0 ? (size_t)(mb*1024.0*1024.0) : Q38T_DEV_RESERVE;
+    }
     return Q38T_DEV_RESERVE;
 }
 
@@ -420,9 +439,9 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * the run. Q38T_DEV_RESERVE_MB lowers it stepwise (3584 -> 2048 -> 1024,
      * watching upload_fail) because in prefill the backend takes ~200 MB per
      * card, and the reserve is worth ~1900 experts per GiB. */
-    size_t reserve=dev_reserve();
     const char *bg=getenv("CUDA_EXPERT_GB");
     for(int i=0;i<G.ndev;i++){
+        size_t reserve=dev_reserve_for(G.dev[i]);
         size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
         /* An explicit budget above what the card can still take made every
          * upload fail until the uploader's clamp kicked in (#1411's lesson):
@@ -1092,6 +1111,8 @@ static struct {
     int checked, wanted;      /* env gate, resolved once */
     int attached;             /* 0 = not tried, 1 = context adopted, -1 = refused */
     int ndev, dev[Q38T_MAX_DEV];
+    int rank[Q38T_MAX_DEV];   /* dev ids, strongest card first (see dense_rank) */
+    int pin;                  /* Q38_DENSE_DEV: pin every dense tensor here, -1 = auto */
     uint64_t calls, rows, refusals;
     size_t bytes;
 } DG;
@@ -1109,6 +1130,48 @@ int q38t_dense_enabled(void){
         DG.wanted=(e && *e=='1');
     }
     return DG.wanted;
+}
+
+/* Order the devices strongest-first for compute-heavy work.
+ *
+ * The cards in this machine are NOT interchangeable and the placement must say
+ * so: dev1 is an RTX 5070 Ti wired PCIe x16, dev0 an RTX 5060 Ti in a slot that
+ * is electrically x4 -- the card itself would do x8, but the copper is x4 and
+ * the link trains there permanently. That is ~2x the SMs and ~4x the upload
+ * bandwidth on one side. The previous policy picked the card with the
+ * most free VRAM, which on two nearly-full cards is close to a coin toss -- and
+ * a coin toss puts half the dense GEMMs on the weak, narrow card.
+ *
+ * SM count is the primary key because dense matmul time scales with it; the
+ * PCIe width -- negotiated, not advertised, see coli_cuda_device_profile --
+ * breaks ties and stands in for the cost of getting a multi-GiB resident tensor
+ * onto the card in the first place. Nothing here is specific to
+ * these two parts: a machine with two identical cards ranks them by device id
+ * and behaves exactly as before. Q38_DENSE_DEV overrides the whole thing. */
+static void dense_rank(void){
+    int sm[Q38T_MAX_DEV]={0}, pw[Q38T_MAX_DEV]={0};
+    for(int i=0;i<DG.ndev;i++){
+        DG.rank[i]=DG.dev[i];
+        coli_cuda_device_profile(DG.dev[i],&sm[i],&pw[i]);
+    }
+    /* Insertion sort on (sm, pcie width, -dev): ndev is 2 in practice and the
+     * order must be total and stable so the log is reproducible run to run. */
+    for(int i=1;i<DG.ndev;i++){
+        int d=DG.rank[i], a=sm[i], b=pw[i], j=i-1;
+        while(j>=0){
+            int aj=0,bj=0;
+            for(int k=0;k<DG.ndev;k++) if(DG.dev[k]==DG.rank[j]){ aj=sm[k]; bj=pw[k]; break; }
+            if(aj>a || (aj==a && bj>b) || (aj==a && bj==b && DG.rank[j]<d)) break;
+            DG.rank[j+1]=DG.rank[j]; j--;
+        }
+        DG.rank[j+1]=d;
+    }
+    for(int i=0;i<DG.ndev;i++){
+        int a=0,b=0;
+        for(int k=0;k<DG.ndev;k++) if(DG.dev[k]==DG.rank[i]){ a=sm[k]; b=pw[k]; break; }
+        fprintf(stderr,"[q38dense] rank %d: dev %d (%d SM, PCIe x%d)%s\n",
+                i,DG.rank[i],a,b,i?"":"  <- preferred for dense");
+    }
 }
 
 /* First use: adopt the existing device context if there is one, bootstrap our
@@ -1150,23 +1213,45 @@ static int dense_attach(void){
     if(DG.ndev<1) return 0;
     DG.attached=1;
     fprintf(stderr,"[q38dense] bf16 dense matmuls on GPU, %d device(s)\n",DG.ndev);
+    dense_rank();
+    DG.pin=-1;
+    {   const char *p=getenv("Q38_DENSE_DEV");
+        if(p && *p){
+            int want=atoi(p);
+            for(int i=0;i<DG.ndev;i++) if(DG.dev[i]==want){ DG.pin=want; break; }
+            if(DG.pin<0)
+                fprintf(stderr,"[q38dense] Q38_DENSE_DEV=%s is not one of the "
+                               "attached devices, ignored\n",p);
+            else
+                fprintf(stderr,"[q38dense] pinned to dev %d by Q38_DENSE_DEV\n",DG.pin);
+        }
+    }
     return 1;
 }
 
-/* Least-loaded placement: the card with the most free VRAM takes the tensor.
- * With two cards and a dense set that does not fit on one, this is what spreads
- * lm_head and the DeltaNet projections across them without a placement table. */
+/* Strongest-card-first placement: walk the ranking and take the first card the
+ * tensor actually fits on. This deliberately replaces the old least-loaded rule
+ * (most free VRAM wins), which spread the dense set evenly over two cards that
+ * are not evenly capable -- see dense_rank. Filling the strong card before
+ * touching the weak one is the point, not a side effect: the overflow onto the
+ * second card is a fallback, and the stats say how much of it happened.
+ *
+ * The 256 MiB margin leaves the backend room for its activation scratch; a
+ * tensor that fits with nothing to spare turns the NEXT allocation into the
+ * failure, which is a much harder thing to read in a log. */
 static int dense_pick_device(size_t need){
-    int best=-1; size_t best_free=0;
+    size_t margin=(size_t)256*1024*1024;
+    if(DG.pin>=0){
+        size_t fr=0,tot=0;
+        if(coli_cuda_mem_info(DG.pin,&fr,&tot) && fr>=need+margin) return DG.pin;
+        return -1;   /* pinned means pinned: no silent spill to the other card */
+    }
     for(int i=0;i<DG.ndev;i++){
         size_t fr=0,tot=0;
-        if(!coli_cuda_mem_info(DG.dev[i],&fr,&tot)) continue;
-        if(fr>best_free){ best_free=fr; best=DG.dev[i]; }
+        if(!coli_cuda_mem_info(DG.rank[i],&fr,&tot)) continue;
+        if(fr>=need+margin) return DG.rank[i];
     }
-    /* Leave the backend room for its activation scratch: a tensor that fits
-     * with nothing to spare turns the next allocation into the failure. */
-    if(best<0 || best_free < need + (size_t)256*1024*1024) return -1;
-    return best;
+    return -1;
 }
 
 int q38t_dense_matmul(void **slot, float *y, const float *x, const uint16_t *w,

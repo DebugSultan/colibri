@@ -1367,6 +1367,57 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
 }
 
+/* Capability profile of a device, for placing compute-heavy work on the card
+ * that can actually run it. Two numbers, both measured, never guessed:
+ *
+ *   sm    - multiProcessorCount, the compute signal. A GB203 part has roughly
+ *           twice the SMs of a GB206 one, and dense GEMM scales with them.
+ *   pcie  - the NEGOTIATED PCIe link width, read from sysfs. The CUDA runtime
+ *           has no attribute for it and linking NVML just for this would be a
+ *           new dependency, but cudaDeviceProp hands us the PCI address, and
+ *           /sys/bus/pci/devices/<addr>/current_link_width is the width the
+ *           link actually trained to.
+ *
+ *           current, NOT max: max_link_width is what the CARD can do, and a
+ *           card can sit in a slot that is electrically narrower than its own
+ *           capability. That is the case here -- the 5060 Ti reports max x8 and
+ *           trains at x4, because the slot is wired x4 and no amount of card
+ *           capability changes the copper. Taking max would credit that card
+ *           with twice the bandwidth it can ever have. Width does not downtrain
+ *           with idleness the way link SPEED does -- the gen drops to 1 on an
+ *           idle card while the width stays put, observed directly on both
+ *           cards here -- so reading this at startup is safe. A link trained x4
+ *           uploads at a quarter of the bandwidth of one trained x16, which
+ *           decides where a multi-GiB resident tensor should live independently
+ *           of how fast the card computes.
+ *
+ * Returns 0 and leaves the outputs untouched if the properties cannot be read;
+ * pcie is set to 0 when sysfs has nothing to say, which callers must treat as
+ * "unknown", not as "narrow". */
+extern "C" int coli_cuda_device_profile(int device, int *sm, int *pcie_width) {
+    cudaDeviceProp prop{};
+    if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) return 0;
+    if (sm) *sm = prop.multiProcessorCount;
+    if (pcie_width) {
+        /* current first; max only as a fallback for the case where the
+         * negotiated width is unreadable, where an overestimate still beats no
+         * information at all. */
+        static const char *const attrs[2] = { "current_link_width", "max_link_width" };
+        int width = 0;
+        for (int a = 0; a < 2 && width <= 0; a++) {
+            char path[160];
+            snprintf(path, sizeof path, "/sys/bus/pci/devices/%04x:%02x:%02x.0/%s",
+                     prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, attrs[a]);
+            FILE *f = fopen(path, "r");
+            if (!f) continue;
+            if (fscanf(f, "%d", &width) != 1) width = 0;
+            fclose(f);
+        }
+        *pcie_width = width > 0 ? width : 0;
+    }
+    return 1;
+}
+
 /* #653: 1 when the device shares physical memory with the host (Grace-Blackwell /
  * GB10, Jetson, integrated GPUs). On these the expert tier and the RAM cache draw
  * from the same pool, so the RAM budget must account for the tier; on a discrete GPU
