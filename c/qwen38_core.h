@@ -298,9 +298,18 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
      * GEMV from there; prefill rows and any failure take the CPU path below,
-     * so the BF16 copy stays the reference for everything but S == 1. */
+     * so the BF16 copy stays the reference for everything but S == 1 --
+     * unless Q38_TRUNK_PREFILL=1 opts the batch into the same int8 rows.
+     * The kernel was always batch-shaped (quant_matmul launches grid (O,S));
+     * upstream pinned the reference for its own hardware, where prefill is
+     * not 19.7 seconds of CPU bf16 GEMM like it is on this rig. */
+    static int trunk_prefill=-1;
+    if(trunk_prefill<0){const char*tp=getenv("Q38_TRUNK_PREFILL");
+                        trunk_prefill=(tp&&tp[0]=='1'&&!tp[1])?1:0;}
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
+    if(S>1&&trunk_prefill&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
+       qt_dense_matmul_batch(weight->gpu-1,y,x,S,I,O))return;
     if(S==1&&weight&&weight->q8&&weight->rows==O&&weight->cols==I){
         /* the int8 rows the GPU would hold, computed here: what the trunk
          * quantization alone does to the output, GPU or not */
@@ -2486,6 +2495,23 @@ static void q38_trunk_place_all(Model *m) {
             int ok=qt_dense_matmul(h,yg,x,I,O); double num=0,den=0; int worst=0;
             for(int r=0;r<O;r++){double d=yg[r]-yc[r]; num+=d*d; den+=(double)yc[r]*yc[r]; if(fabs(d)>fabs(yg[worst]-yc[worst]))worst=r;}
             fprintf(stderr,"[selftest] %-7s L%-2d [O=%d I=%d] ok=%d rel.err %.2e worst row %d gpu %.5g cpu %.5g\n",it->name,it->layer,O,I,ok,den>0?sqrt(num/den):-1.0,worst,yg[worst],yc[worst]);
+            if(ok&&O<=24576){
+                /* DIAG batch: the same handle answering S rows -- the shape
+                 * Q38_TRUNK_PREFILL puts under real tokens. Two synthetic
+                 * rows, same int8 reference on the CPU, per-row rel.err. */
+                const int SB=2;
+                float *xb=(float*)malloc((size_t)SB*I*sizeof(float)),*ygb=(float*)malloc((size_t)SB*O*sizeof(float)),*ycb=(float*)malloc((size_t)SB*O*sizeof(float));
+                for(int r2=0;r2<SB;r2++)for(int k=0;k<I;k++)xb[(size_t)r2*I+k]=x[k]*(r2?0.7f+0.01f*(k%3):1.f);
+                for(int r2=0;r2<SB;r2++)for(int r=0;r<O;r++){double a=0; const float*xr=xb+(size_t)r2*I;
+                    for(int k=0;k<I;k++)a+=(double)q[(size_t)r*I+k]*xr[k]; ycb[(size_t)r2*O+r]=(float)(a*sc[r]);}
+                int okb=qt_dense_matmul_batch(h,ygb,xb,SB,I,O);
+                double worstb=0;
+                for(int r2=0;r2<SB;r2++){double bn=0,bd=0;
+                    for(int r=0;r<O;r++){double d=ygb[(size_t)r2*O+r]-ycb[(size_t)r2*O+r]; bn+=d*d; bd+=(double)ycb[(size_t)r2*O+r]*ycb[(size_t)r2*O+r];}
+                    double re=bd>0?sqrt(bn/bd):-1.0; if(re>worstb)worstb=re;}
+                fprintf(stderr,"[selftest] %-7s L%-2d batch(S=%d) ok=%d worst-row rel.err %.2e\n",it->name,it->layer,SB,okb,worstb);
+                free(xb);free(ygb);free(ycb);
+            }
             free(x);free(yg);free(yc);
         }
         free(q); free(sc);
