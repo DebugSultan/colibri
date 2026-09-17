@@ -677,7 +677,18 @@ static int q38_env_bool(const char *name,int default_value) {
  * the default keeps ours -- which is where every number in the register was
  * taken. The A/B of the two on the 2x16 GB rig decides which one survives
  * as the default. */
-static int q38_tier_choice(void){ return q38_env_bool("Q38_TIER_TRUNK",0); }
+static int q38_tier_choice(void){
+    /* 0 = our arena tier (experts int4 + eager bf16 dense), 1 = upstream's
+     * #1424 tier (fp8 streaming experts + int8 dense trunk), 2 = HYBRID: our
+     * arena owns the experts and upstream's int8 trunk owns the dense side --
+     * the two halves the night-13 A/B measured as each tier's win. The loop
+     * and the eager gate read the mode; only mode 1 lets qt_* touch the
+     * expert route, and any nonzero mode starts the trunk placer. */
+    const char *e=getenv("Q38_TIER_TRUNK");
+    if(e&&e[0]=='1'&&!e[1])return 1;
+    if(e&&e[0]=='2'&&!e[1])return 2;
+    return 0;
+}
 
 /* Soglia di adesione alla porta densa, in MiB (Q38_DENSE_MIN_MB, default 4).
  * In decode ogni matmul sulla porta è un round-trip PCIe con sync (x va su,
@@ -1029,7 +1040,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
             fmt=4; gs=i4_gs; scale_count=i4_sc;
         }
         m->tier_fmt=fmt;
-        m->tier=q38_tier_choice()?0:q38t_init(c->layers,c->experts,c->hidden,c->inter,c->topk,
+        m->tier=q38_tier_choice()==1?0:q38t_init(c->layers,c->experts,c->hidden,c->inter,c->topk,
                           scale_count,m->native_fp8,fmt,gs);
     }
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
@@ -2507,7 +2518,10 @@ static void q38_tier_start(Model *m,int cap) {
     q38_trunk_offer_all(m);                        /* sizes only; the placer decides in qt_init */
     if(qt_init_fp8(c->layers,c->experts,c->hidden,c->inter,cap,c->topk,E4M3_LUT)){
         atexit(qt_shutdown);
-        fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
+        if(q38_tier_choice()==2)
+            fprintf(stderr,"[qtier] qwen38: HYBRID -- int8 dense trunk on, experts stay on the arena tier (qt_issue is never called)\n");
+        else
+            fprintf(stderr,"[qtier] qwen38: fp8 expert tier on (RAM LRU %d/layer stays; experts stream to VRAM as they get hot)\n",cap);
         q38_trunk_place_all(m);
     }
 }
@@ -2541,7 +2555,7 @@ static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,floa
          * either: q38_tier_choice() decides at startup, and Q38_TIER_TRUNK=1
          * runs upstream's streaming fp8 tier with its qt_* calls, the
          * default runs ours. */
-        const int trunk=q38_tier_choice();
+        const int trunk=q38_tier_choice()==1;   /* hybrid (2): experts stay ours */
         uint32_t gmask=0;
         if(trunk)gmask=qt_issue(layer,idx,K,xs);
         else if(m->tier){ q38t_note(layer,idx,K); gmask=q38t_issue(layer,idx,K,xs); }

@@ -1137,7 +1137,7 @@ int q38t_dense_enabled(void){
          * int8 trunk): our dense port must stay off with it, or the same
          * matrices get staged twice under two budgets. */
         const char *t=getenv("Q38_TIER_TRUNK");
-        DG.wanted=(e && *e=='1') && !(t && *t=='1' && !t[1]);
+        DG.wanted=(e && *e=='1') && !(t && (*t=='1'||*t=='2') && !t[1]);
     }
     return DG.wanted;
 }
