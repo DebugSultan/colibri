@@ -785,6 +785,19 @@ int qt_dense_matmul(int h, float *y, const float *x, int I, int O){
     G_dense[h].on = 0;
     return 0;
 }
+/* The same tensor answering a batch: quant_matmul is launched grid (O,S) and
+ * was always batch-shaped -- upstream pinned the call to S==1 to keep BF16
+ * the prefill reference, not because the kernel refused rows. A failure here
+ * is sticky for the handle like the GEMV one: prefill falls back to CPU and
+ * stays there. */
+int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
+    if(S < 2) return 0; /* the S==1 path is a different call, use it */
+    if(h < 0 || h >= G_dense_n || !G_dense[h].on) return 0;
+    if(coli_cuda_matmul(&G_dense[h].t, y, x, NULL, NULL, 1, S, I, O, G_dense[h].dev, 0)) return 1;
+    fprintf(stderr,"[dense] handle %d GPU batched matmul (S=%d) failed; CPU from here on\n", h, S);
+    G_dense[h].on = 0;
+    return 0;
+}
 int qt_dense_count(void){ return G_dense_n; }
 
 int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
