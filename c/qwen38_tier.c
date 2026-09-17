@@ -119,7 +119,7 @@ static struct {
     uint32_t *heat0;
 } VTG;
 
-static Q38TSlot *qs(int layer, int eid){ return &VTG.slot[(size_t)layer*VTG.ne + eid]; }
+static Q38TSlot *vt_qs(int layer, int eid){ return &VTG.slot[(size_t)layer*VTG.ne + eid]; }
 static int vt_home(int eid){ return eid % VTG.ndev; }
 
 /* Host-RAM pinning hooks (residenza totale): the ENGINE owns the resolution
@@ -136,7 +136,7 @@ void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int)){
 }
 
 /* Arena free-list. Every take and give happens under VTG.mx, in lockstep with
- * the budget charge it mirrors; the uploader reads only the arena_idx it
+ * the budget charge it mirrors; the vt_uploader reads only the arena_idx it
  * already owns. UINT32_MAX from arena_take means "no slot" -- the budget
  * invariant (used+exp <= budget) makes it unreachable; if it ever happens
  * the offer is dropped and counted, never served silently. */
@@ -212,7 +212,7 @@ static void vt_stage(uint8_t *dw, float *dsc,
     memcpy(dsc, scales, 3*VTG.sc*sizeof(float));
 }
 
-static void *uploader(void *arg){
+static void *vt_uploader(void *arg){
     (void)arg;
     for(;;){
         pthread_mutex_lock(&VTG.mx);
@@ -226,7 +226,7 @@ static void *uploader(void *arg){
         if(ve>=0){
             /* swap: the victim is freed only when no group is in flight */
             while(VTG.issue_open && !VTG.th_stop) pthread_cond_wait(&VTG.cv_take,&VTG.mx);
-            Q38TSlot *v=qs(vl,ve);
+            Q38TSlot *v=vt_qs(vl,ve);
             if(VTG.th_stop && VTG.issue_open){
                  /* Shutdown with a group still open: q38t_take, the only thing
                   * that clears issue_open, will never come. The swap is
@@ -234,7 +234,7 @@ static void *uploader(void *arg){
                   * can still read; the resident flag had already been turned
                   * off by the one who queued, so it is put back the way it
                   * was. */
-                v->resident=1; qs(layer,eid)->queued=0; VTG.inflight--;
+                v->resident=1; vt_qs(layer,eid)->queued=0; VTG.inflight--;
                 pthread_cond_broadcast(&VTG.cv_take);
                 pthread_mutex_unlock(&VTG.mx); free(w); free(sc); continue;
             }
@@ -250,7 +250,7 @@ static void *uploader(void *arg){
         } else pthread_mutex_unlock(&VTG.mx);
 
         int dv=VTG.dev[vt_home(eid)];
-        uint32_t aidx=qs(layer,eid)->arena_idx;
+        uint32_t aidx=vt_qs(layer,eid)->arena_idx;
         uint8_t *slotw=VTG.arena[vt_home(eid)] + (size_t)aidx*VTG.exp_bytes;
         float *slotsc=(float*)(slotw + 3*VTG.mat_bytes);
         /* gate/up are [inter,hidden], down is [hidden,inter]; the signature
@@ -262,7 +262,7 @@ static void *uploader(void *arg){
               && coli_cuda_tensor_upload_into(&td, w+2*VTG.mat_bytes, sc+2*VTG.sc, VTG.fmt, VTG.Ih, VTG.D,  dv, VTG.gs, slotw+2*VTG.mat_bytes,   slotsc+2*VTG.sc);
         free(w); free(sc);
         pthread_mutex_lock(&VTG.mx);
-        Q38TSlot *s=qs(layer,eid);
+        Q38TSlot *s=vt_qs(layer,eid);
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; VTG.uploads++; }
         else  { int hd=vt_home(eid);
                 VTG.upload_fail++;
@@ -289,7 +289,7 @@ static void *uploader(void *arg){
  *
  * With OMP_PROC_BIND set, libgomp binds the initial thread to place 0 before
  * main() runs, and a pthread inherits the CPU mask of the thread that creates
- * it. The uploader thread and the CUDA runtime's own threads were therefore
+ * it. The vt_uploader thread and the CUDA runtime's own threads were therefore
  * jailed on the OpenMP master's core: every staging copy and every driver
  * call competed with the master thread's share of each expert matmul, and
  * the whole team waited for it. Measured on Qwen3.8 upstream (12 threads, one
@@ -365,7 +365,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     if(fmt==4){
         /* The group size has to divide both axes, or the three matrices do
          * not bill the same number of scales and the single VTG.sc stride in
-         * vt_stage() and in the uploader would be wrong. q38_int4_group_size
+         * vt_stage() and in the vt_uploader would be wrong. q38_int4_group_size
          * already refuses anything else at load time; this is the tier's own
          * check, because a tier that silently stages the wrong stride is the
          * defect class that costs a whole window. */
@@ -432,14 +432,14 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * It used to be the cudaMalloc footprint (3.33 MiB billed for a 2.64 MiB
      * int4 expert): honest while each expert was six separate cudaMallocs,
      * and the over-commit froze budgets permanently via the clamp
-     * (VTG.budget[hd]=VTG.used[hd] in the uploader). The arena below removes the
+     * (VTG.budget[hd]=VTG.used[hd] in the vt_uploader). The arena below removes the
      * rounding itself, so the charge follows it: real bytes, no slack. */
     /* How much VRAM to leave to the backend. One GiB was an eyeball estimate,
      * and it is measured wrong: the backend allocates its work tensors and
      * cuBLASLt workspaces AFTER the tier has already taken its weights, so
      * the "free" read here is the most optimistic value of the whole run.
      * 128-token probe with a 1 GiB reserve: declared budget 14.2/14.3 GB,
-     * two "[CUDA] tensor allocation: out of memory", and the uploader's
+     * two "[CUDA] tensor allocation: out of memory", and the vt_uploader's
      * adaptive clamp settled at 11.9/12.0 GB -- the backend needed ~3.3 GB,
      * not 1. Q38T_DEV_RESERVE is the default and the clamp stays as a net:
      * if the card fills up anyway the tier stops promoting instead of failing
@@ -451,7 +451,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
         size_t reserve=dev_reserve_for(VTG.dev[i]);
         size_t freeb=0,totb=0; coli_cuda_mem_info(VTG.dev[i],&freeb,&totb);
         /* An explicit budget above what the card can still take made every
-         * upload fail until the uploader's clamp kicked in (#1411's lesson):
+         * upload fail until the vt_uploader's clamp kicked in (#1411's lesson):
          * the ceiling is min(requested, measured headroom), and the banner
          * says so. */
         size_t headroom = freeb>reserve ? freeb-reserve : 0;
@@ -538,8 +538,8 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     pthread_mutex_init(&VTG.mx,NULL);
     pthread_cond_init(&VTG.cv,NULL);
     pthread_cond_init(&VTG.cv_take,NULL);
-    q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* the uploader inherits this mask */
-    if(pthread_create(&VTG.th,NULL,uploader,NULL)!=0){
+    q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* the vt_uploader inherits this mask */
+    if(pthread_create(&VTG.th,NULL,vt_uploader,NULL)!=0){
         free(VTG.slot); free(VTG.is_x);
         for(int i=0;i<VTG.ndev;i++){
             if(VTG.arena[i]) coli_cuda_pipe_free(VTG.dev[i],VTG.arena[i]);
@@ -562,7 +562,7 @@ int q38t_ready(void){ return VTG.on; }
 int q38t_is_resident(int layer,int eid){
     if(!VTG.on||layer<0||layer>=VTG.nl||eid<0||eid>=VTG.ne) return 0;
     pthread_mutex_lock(&VTG.mx);
-    int r=qs(layer,eid)->resident;
+    int r=vt_qs(layer,eid)->resident;
     pthread_mutex_unlock(&VTG.mx);
     return r;
 }
@@ -585,7 +585,7 @@ void q38t_note(int layer,const int *eids,int K){
     for(int k=0;k<K;k++){
         int e=eids[k];
         if(e<0||e>=VTG.ne) continue;
-        Q38TSlot *s=qs(layer,e);
+        Q38TSlot *s=vt_qs(layer,e);
         if(s->heat<0xFFFFFFFFu) s->heat++;
     }
     pthread_mutex_unlock(&VTG.mx);
@@ -606,7 +606,7 @@ static int vt_enqueue_locked(int layer,int eid,int v_layer,int v_eid,
     VTG.q[VTG.qt_].w=w;         VTG.q[VTG.qt_].s=sc;
     VTG.q[VTG.qt_].v_layer=v_layer; VTG.q[VTG.qt_].v_eid=v_eid;
     VTG.qt_=(VTG.qt_+1)%Q38T_QCAP; VTG.qn++; VTG.inflight++;
-    qs(layer,eid)->queued=1;
+    vt_qs(layer,eid)->queued=1;
     pthread_cond_signal(&VTG.cv);
     return 1;
 }
@@ -619,7 +619,7 @@ void q38t_offer(int layer,int eid,
     long rel=-1;                              /* demoted victim awaiting relock */
     pthread_mutex_lock(&VTG.mx);
     VTG.offers++;
-    Q38TSlot *s=qs(layer,eid);
+    Q38TSlot *s=vt_qs(layer,eid);
     if(s->resident||s->queued){ pthread_mutex_unlock(&VTG.mx); goto out; }
 
     int di=vt_home(eid);
@@ -693,7 +693,7 @@ void q38t_offer(int layer,int eid,
                               gate,up,down,scales)){
                 VTG.swaps++;
                 s->arena_idx=v->arena_idx;       /* the replacement inherits the
-                                                    victim's slot; the uploader
+                                                    victim's slot; the vt_uploader
                                                     frees the victim's tensors
                                                     before writing this slot */
                 rel=cold;                        /* back to CPU fallback: relock */
@@ -726,7 +726,7 @@ uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
     for(int k=0;k<K;k++){
         int e=eids[k];
         if(e<0||e>=VTG.ne){ VTG.miss++; continue; }
-        Q38TSlot *s=qs(layer,e);
+        Q38TSlot *s=vt_qs(layer,e);
         if(!s->resident){ VTG.miss++; continue; }
         int di=vt_home(e), c=VTG.is_cnt[di];
         /* The backend keeps a single issue in flight per device and refuses
@@ -833,13 +833,13 @@ static int pf_flush(int layer,const int *eids,const int *rows,const int *off,
     ColiCudaTensor *tg[64],*tu[64],*td[64];
     int r[64];
     /* The tensors are read under the lock and issue_open is raised before
-     * letting it go: from here until the flag drops the uploader cannot free
-     * a victim (uploader(), "swap: the victim is freed only when no group is
+     * letting it go: from here until the flag drops the vt_uploader cannot free
+     * a victim (vt_uploader(), "swap: the victim is freed only when no group is
      * in flight"). Same protocol as issue/take, synchronous instead of split. */
     pthread_mutex_lock(&VTG.mx);
     int c=0;
     for(int j=0;j<n;j++){
-        Q38TSlot *s=qs(layer,eids[bi[j]]);
+        Q38TSlot *s=vt_qs(layer,eids[bi[j]]);
         if(!s->resident||!s->tg||!s->tu||!s->td){ VTG.pf_absent++; continue; }
         tg[c]=s->tg; tu[c]=s->tu; td[c]=s->td; r[c]=rows[bi[j]];
         /* bi[] is reused below to scatter, so compact it the same way */
@@ -900,7 +900,7 @@ int q38t_expert_group(int layer,const int *eids,const int *rows,const int *off,
         for(int c=0;c<count;c++){
             if(rows[c]<1||done[c]) continue;
             if(eids[c]<0||eids[c]>=VTG.ne||vt_home(eids[c])!=di) continue;
-            if(!qs(layer,eids[c])->resident) continue;   /* rechecked under lock */
+            if(!vt_qs(layer,eids[c])->resident) continue;   /* rechecked under lock */
             /* 64 experts is the backend's own ceiling (GroupDesc host[64],
              * backend_cuda.cu:1850); the row budget is ours. An expert whose
              * group alone exceeds the budget still goes through, on its own. */
@@ -961,7 +961,7 @@ int q38t_plan_fill(int *layers,int *eids,int max){
 void q38t_cancel_plan(int layer,int eid){
     if(!VTG.on||layer<0||layer>=VTG.nl||eid<0||eid>=VTG.ne) return;
     pthread_mutex_lock(&VTG.mx);
-    Q38TSlot *s=qs(layer,eid);
+    Q38TSlot *s=vt_qs(layer,eid);
     if(s->planned&&!s->queued&&!s->resident){
         int di=vt_home(eid);
         if(VTG.used[di]>=VTG.exp_bytes) VTG.used[di]-=VTG.exp_bytes;

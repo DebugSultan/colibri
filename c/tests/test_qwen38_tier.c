@@ -41,7 +41,7 @@ static void seed(void) {
 
 static int resident_count(int layer) {
     int r = 0;
-    for (int eid = 0; eid < NE; eid++) r += qs(layer, eid)->resident;
+    for (int eid = 0; eid < NE; eid++) r += vt_qs(layer, eid)->resident;
     return r;
 }
 

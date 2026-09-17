@@ -68,7 +68,7 @@ int main(void) {
      * resident. No polling, no sleeping -- the wait IS the guarantee. */
     int queued = 0, resident = 0;
     pthread_mutex_lock(&VTG.mx);
-    for (int eid = 0; eid < NE; eid++) { queued += qs(0, eid)->queued; resident += qs(0, eid)->resident; }
+    for (int eid = 0; eid < NE; eid++) { queued += vt_qs(0, eid)->queued; resident += vt_qs(0, eid)->resident; }
     pthread_mutex_unlock(&VTG.mx);
     check(queued == 0, "an expert is still queued when q38t_fill_wait returns");
     check(resident == NE, "not every enqueued expert is resident when q38t_fill_wait returns");
