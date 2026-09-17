@@ -122,4 +122,25 @@ void coli_cuda_pipe_free(int device, void *p) {
     free(p);
 }
 
+/* dense port and probe additions: referenced by q38t_dense_matmul/stats,
+ * inert here -- the tier accounting tests never drive the dense path. */
+int coli_cuda_matmul(ColiCudaTensor **t, float *y, const float *x, const void *w,
+                     const float *sc, int fmt, int S, int I, int O, int dev, int gs) {
+    (void)y; (void)x; (void)w; (void)sc; (void)fmt; (void)S; (void)I; (void)O; (void)dev; (void)gs;
+    if (t) *t = NULL;   /* refusal contract: y untouched, caller falls to CPU */
+    return 0;
+}
+size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { (void)t; return 0; }
+void coli_cuda_tc_w4a16_rows(uint64_t *rows) { if (rows) *rows = 0; }
+void coli_cuda_mm_trace(uint64_t *n, double *wall_us, double *ev_us, double *max_us) {
+    (void)wall_us; (void)ev_us; (void)max_us; if (n) *n = 0;
+}
+int coli_cuda_device_at(int index) { return index; }
+int coli_cuda_device_name(int device, char *out, size_t cap) {
+    (void)device; if (out && cap) snprintf(out, cap, "fake"); return 1;
+}
+int coli_cuda_device_profile(int device, int *sm, int *pcie_width) {
+    (void)device; if (sm) *sm = 70; if (pcie_width) *pcie_width = 16; return 1;
+}
+
 #endif /* QWEN38_FAKE_CUDA_H */

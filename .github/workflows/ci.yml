@@ -472,6 +472,46 @@ jobs:
             echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
           fi
           echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Reusing a previous turn's state must change the timing and nothing
+          # else. A wrong reuse length does not crash: it answers from another
+          # conversation's state and still reads plausibly, so this is the only
+          # gate that would catch it. The sanitizer step above rebuilt the
+          # engine, so rebuild the normal one first.
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          QWEN36_TINY=qwen36_tiny_c python3 -m unittest -v tests.test_qwen36_prefix_serve
+      - name: Expert kernel A/B on an int4 gs64 fixture (old path vs expert_ffn.h, byte-identical ids)
+        run: |
+          cd c
+          make clean >/dev/null 2>&1 || true
+          make qwen36
+          # The int8 gate above never enters the shared kernel (it needs an int4
+          # gs=64 container with widths that are multiples of 64: the default
+          # tiny has inter=32). This fixture does. The reference is the same
+          # torch model, but what this step asserts is not oracle agreement
+          # (int4 experts drift from f32 by design): it is that the kernel and
+          # the unpack-to-int8 path it replaces emit the SAME ids at every cap,
+          # including cap=1 (one expert resident: the per-pair cut) and cap=16
+          # (the whole prompt in one run).
+          python3 tools/make_qwen36_tiny.py --out qwen36_tiny64 --ref-mode full --inter 64 \
+                  --emit-ref qwen36_tiny64/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen36_tiny64 --out qwen36_tiny64_c --ebits 4 --gs 64
+          for cap in 1 2 8 16; do
+            for k in 0 1; do
+              QWEN_EXPERT_KERNEL=$k COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c \
+                ./qwen36 "$cap" 4 qwen36_tiny64/ref_full.json > ab_${cap}_$k.log 2>&1 || true
+              grep -E "^C engine" ab_${cap}_$k.log > ids_${cap}_$k.txt
+            done
+            grep -q "expert kernel: planar int4" ab_${cap}_1.log || { echo "FAIL: kernel did not engage at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            grep -q "expert kernel: planar int4" ab_${cap}_0.log && { echo "FAIL: QWEN_EXPERT_KERNEL=0 still engaged the kernel"; exit 1; }
+            test -s ids_${cap}_1.txt || { echo "FAIL: no ids at cap=$cap"; cat ab_${cap}_1.log; exit 1; }
+            cmp ids_${cap}_0.txt ids_${cap}_1.txt || { echo "FAIL: ids differ at cap=$cap"; cat ids_${cap}_0.txt ids_${cap}_1.txt; exit 1; }
+            echo "cap=$cap: identical ($(cat ids_${cap}_1.txt))"
+          done
+          make tests/test_expert_ffn && ./tests/test_expert_ffn
       - name: A malformed container is refused, not read
         run: |
           cd c
@@ -561,6 +601,18 @@ jobs:
         run: |
           cd c
           OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_dashboard_hits
+      - name: "Over-long prompt: CONTEXT_EXCEEDED, so the gateway answers 400"
+        run: |
+          cd c
+          COLI_OLMOE_FIXTURE=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_context_exceeded
+      - name: KV prefix reuse is token-identical (serve, several turns)
+        run: |
+          cd c
+          # Same contract as the Qwen3.6 job runs, from the same harness: a
+          # reused prefix must produce exactly what a cold engine produces for
+          # the same prompt. Wrong reuse is silent, so the gate is the only
+          # thing between it and a user.
+          OLMOE_TINY=olmoe_tiny_c python3 -m unittest -v tests.test_olmoe_prefix_serve
 
   dsv41-tiny-check:
     name: DeepSeek V4.1 tiny oracle (engram + DSA + fp4 experts + vision)
@@ -596,6 +648,52 @@ jobs:
             SNAP=dsv41_tiny ./deepseek_v41 "$cap" dsv41_tiny/ref.json
             echo "::endgroup::"
           done
+      - name: "Multi-SSD mirror and O_DIRECT change nothing about the answer"
+        run: |
+          cd c
+          # A replica answers the same bytes: the same container in a second directory
+          # must produce the same token stream, on the primary and through the mirror,
+          # with the O_DIRECT window and with the buffered path it replaces. Routing an
+          # expert to a drive is an I/O decision and must not be visible downstream.
+          mkdir -p dsv41_mirror
+          cp dsv41_tiny/model.safetensors dsv41_mirror/
+          SNAP=dsv41_tiny ./deepseek_v41 8 dsv41_tiny/ref.json > primary.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror ./deepseek_v41 8 dsv41_tiny/ref.json > mirror.txt 2>/dev/null
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_mirror V41_DIRECT=0 ./deepseek_v41 8 dsv41_tiny/ref.json > buffered.txt 2>/dev/null
+          cmp primary.txt mirror.txt
+          cmp primary.txt buffered.txt
+          # COLI_MODEL_DIRS splits the container as DISTINCT shards -- no second copy,
+          # which is the only multi-drive layout most people can build out of a 510 GB
+          # checkpoint. The shards move; the answer must not.
+          mkdir -p dsv41_split_meta dsv41_split_shard
+          cp dsv41_tiny/config.json dsv41_tiny/tokenizer.json dsv41_tiny/dsv41_engram.json dsv41_split_meta/
+          cp dsv41_tiny/model.safetensors dsv41_split_shard/
+          SNAP=dsv41_split_meta COLI_MODEL_DIRS=dsv41_split_shard ./deepseek_v41 8 dsv41_tiny/ref.json > split.txt 2>split.err
+          cmp primary.txt split.txt
+          grep -q "\[SPLIT\] model across 2 dir(s)" split.err
+          # A copy that is not byte-identical is not a replica: it is refused, and the
+          # run stays on the primary rather than reading someone else's offsets.
+          mkdir -p dsv41_divergent
+          python3 - <<'PY'
+          import pathlib
+          src = pathlib.Path("dsv41_tiny/model.safetensors")
+          data = bytearray(src.read_bytes())
+          data[8] ^= 0x01        # inside the safetensors header
+          pathlib.Path("dsv41_divergent/model.safetensors").write_bytes(bytes(data))
+          PY
+          SNAP=dsv41_tiny COLI_MODEL_MIRROR=dsv41_divergent ./deepseek_v41 8 dsv41_tiny/ref.json > divergent.txt 2>divergent.err
+          cmp primary.txt divergent.txt
+          grep -q "header differs from the primary copy" divergent.err
+      - name: KV prefix reuse (opt-in here) and the resumed-prefill exactness
+        run: |
+          cd c
+          # Two gates in one file. The first is exactness and is ours: a prefill
+          # that resumes mid-sequence must compute what a cold prefill computes,
+          # which is what the index-key schedule fix is for. The second is the
+          # shared contract, minus the one scenario this engine cannot satisfy --
+          # a prefix holding generated positions, which attend differently from
+          # prefilled ones by the vendor's own design. The override says so.
+          DSV41_TINY=dsv41_tiny python3 -m unittest -v tests.test_dsv41_prefix_serve
       - name: "A prompt longer than one block, so the block boundary is crossed"
         run: |
           cd c
@@ -673,6 +771,8 @@ jobs:
         run: pip install -r c/tools/requirements-qwen38-tiny.txt
       - name: Generate the upstream text fixture and run the token-and-logit oracle
         run: make -C c qwen38-tiny-check
+      - name: Routed experts as the release ships them (FP8 shards), then the engine on the fake CUDA tier
+        run: make -C c qwen38-tiny-fp8-check qwen38-tier-engine-check
       - name: Repeat the eviction path under ASan and UBSan
         run: |
           cd c
@@ -1065,7 +1165,7 @@ jobs:
       # rieseguiva un binario non strumentato. Uno di quei test era rosso da
       # settimane senza che nessuno potesse vederlo.
       - name: Build the engines those tests exercise
-        run: make -C c kimi_k3 inkling colibri olmoe qwen38
+        run: make -C c kimi_k3 inkling colibri olmoe qwen38 qwen36 deepseek_v41
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
 

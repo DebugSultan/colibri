@@ -83,6 +83,13 @@ typedef struct {
     int compute_major,compute_minor;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
+    /* Staging of the resident dense matvec (coli_cuda_matmul), apart from
+     * x/y: the expert group (coli_cuda_expert_group_issue) runs on ctx->stream
+     * asynchronously while the engine's thread keeps computing -- qwen38's
+     * shared expert and the Qwen3.8 trunk go through coli_cuda_matmul between
+     * qt_issue and qt_take. Sharing x/y there overwrote the group's input and
+     * output mid-flight (silent, output-only corruption, no CUDA error). */
+    float *dx, *dy; size_t dx_cap, dy_cap;
     uint8_t *qx; float *qscale;
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y,*host_kv; size_t host_x_cap,host_y_cap,host_kv_cap;
@@ -1316,6 +1323,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (!select_ctx(ctx)) continue;
         if (ctx->x) cudaFree(ctx->x);
         if (ctx->y) cudaFree(ctx->y);
+        if (ctx->dx) cudaFree(ctx->dx);
+        if (ctx->dy) cudaFree(ctx->dy);
         if (ctx->gate) cudaFree(ctx->gate);
         if (ctx->up) cudaFree(ctx->up);
         if (ctx->qx) cudaFree(ctx->qx);
@@ -1337,6 +1346,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->ans_host=nullptr;ctx->ans_host_cap=0;ctx->ans_copy_pending=0;
 #endif
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
+        ctx->dx = ctx->dy = nullptr; ctx->dx_cap = ctx->dy_cap = 0;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->host_x=ctx->host_y=ctx->host_kv=nullptr;ctx->stream=nullptr;
@@ -1892,18 +1902,18 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     if (!select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
-    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
     if (prof) { w1 = mm_now_ms(); cudaEventRecord(ev[0], nullptr); }
-    if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) {
+    if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) {
         if (prof) for (int i=0;i<4;i++) cudaEventDestroy(ev[i]);
         return 0;
     }
     if (prof) { w2 = mm_now_ms(); cudaEventRecord(ev[1], nullptr); }
-    quant_matmul_launch(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     cudaError_t le = cudaGetLastError();
     if (prof) { w3 = mm_now_ms(); cudaEventRecord(ev[2], nullptr); }
     if (!cuda_ok(le, "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) {
+        !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) {
         if (prof) for (int i=0;i<4;i++) cudaEventDestroy(ev[i]);
         return 0;
     }
@@ -2138,11 +2148,16 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
-    /* grouped_s4_wmma's body needs __CUDA_ARCH__>=750: on builds where the
-     * WMMA kernels are compiled out (COLI_HIP_NO_WMMA) the launch would
-     * succeed with an EMPTY kernel and the output buffer would silently keep
-     * stale data. Gate the branch like TC_W4A16 below does. */
-    tc=tc&&!pin_small_batch&&COLI_GPU_HAS_WMMA&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    /* grouped_s4_wmma's body needs __CUDA_ARCH__>=750 AND the s4 fragment type:
+     * on a build where either is missing (COLI_HIP_NO_WMMA, or rocWMMA, which
+     * has no sub-byte precision and defines __CUDA_ARCH__ 700) the launch
+     * succeeds with an EMPTY kernel and the output buffer silently keeps the
+     * previous call's data (#1499). So the gate mirrors the body's own guard:
+     * the s4 flag from backend_gpu_compat.h plus the device's compute
+     * capability, not WMMA availability alone. */
+    tc=tc&&!pin_small_batch&&COLI_GPU_HAS_WMMA&&COLI_GPU_HAS_S4_WMMA&&
+       (ctx->compute_major*10+ctx->compute_minor>=75)&&
+       all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_e8){

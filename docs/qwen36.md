@@ -66,7 +66,43 @@ Both optimizations are bit-exact and on by default.  For controlled A/Bs,
 Requirements: ~30 GB RAM for comfortable expert caching and NVMe storage for
 the container. The default build is CPU-only; `make -C c qwen36 CUDA=1` adds
 the optional CUDA VRAM expert tier documented in
-[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md).
+[`qwen36-cuda-tier.md`](qwen36-cuda-tier.md). The same tier builds for AMD
+through ROCm with `make -C c qwen36 HIP=1 HIP_ARCH=<gfx>` (for example
+`HIP_ARCH=gfx1151`, with `ROCM_HOME` and `HIPCC` pointing at the toolchain):
+measured on a Ryzen AI MAX+ 395, output bit-identical to the CPU path and 2.4x
+faster than CPU-only (#1502).
+
+## The expert kernel
+
+Routed experts run through `c/expert_ffn.h`, a header shared with the other
+MoE engines rather than a set of GEMVs of this engine's own. Three things
+changed with it, measured on the real gs64 container at full residency on an
+8-core AVX-512 box (61 GB, DDR5-5600, 58 GB/s DRAM read):
+
+- **The int4 stays int4.** The engine used to unpack every expert to int8 at
+  load; the kernel keeps the container's nibbles, repacked once into a planar
+  layout where `and 0x0F` yields 32 elements in order and `srli 4` the other
+  32, so a block costs no unpack instruction. Half the bytes per token and half
+  the expert-cache RSS: peak RSS at cap 256 went from 25 GB to 15 GB.
+- **A layer is a unit of work.** gate+up share one pass over the activation,
+  and threads split (expert, row-chunk) items: two OpenMP regions per layer
+  instead of 3 x top-k. A prompt row routed to an expert another row already
+  used reads that expert from cache, not DRAM.
+- **Same tokens.** Activations stay f32 (the kernel also has an int8
+  activation mode, `mode 1`, not wired in here: same policy as `IDOT`). The
+  only difference from the old path is the accumulation order inside a dot;
+  a 1024-token greedy decode on the real container is byte-identical, and CI
+  pins old vs new on a tiny int4 fixture at caps 1, 2, 8 and 16.
+
+Over a 1024-token greedy decode at cap 256 (same prompt, byte-identical
+text): 12.8 -> 15.7 tok/s, MoE per token 34 -> 20 ms on average and 30 -> 17
+ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
+(the DRAM floor for the int4 bytes is 9) and 6 are the residual misses of a
+97.6% hit rate, fetched one at a time; that fetch is the next thing to
+overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
+`QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
+keeps its own path: it uploads the pair-layout int4 and computes misses from
+the int8 copy.
 
 ## Which container?
 

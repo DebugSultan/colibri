@@ -54,6 +54,30 @@ class CliOutputLanguageTest(unittest.TestCase):
         self.assertIn("disk", result.stdout)
         self.assertIn("engine", result.stdout)
 
+    def test_info_without_config_names_no_engine(self):
+        """A directory of shards without config.json used to show the GLM engine
+        as if it were the one to run: the family is unknown, so the engine is
+        unknown, and the line must say what to copy where."""
+        with tempfile.TemporaryDirectory() as model:
+            for i in (1, 2):
+                (Path(model) / f"model-0000{i}-of-00002.safetensors").write_bytes(b"\0" * 8)
+            result = self.run_cli("info", "--model", model)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unknown until config.json is present", result.stdout)
+        self.assertIn("2 shard(s) found here", result.stdout)
+        self.assertIn("model.safetensors.index.json", result.stdout)
+        self.assertNotIn("ready", result.stdout)
+        self.assertNotIn("not built", result.stdout)
+
+    def test_chat_without_config_says_what_to_copy(self):
+        with tempfile.TemporaryDirectory() as model:
+            (Path(model) / "tokenizer.json").write_text("{}", encoding="utf-8")
+            result = self.run_cli("run", "--model", model, "hello")
+        self.assertNotEqual(result.returncode, 0)
+        out = result.stdout + result.stderr
+        self.assertIn("cannot read config.json", out)
+        self.assertIn("coli picks the engine from config.json", out)
+
     def test_info_reads_registered_nested_text_config(self):
         with tempfile.TemporaryDirectory() as model:
             (Path(model) / "config.json").write_text(json.dumps({
@@ -368,13 +392,19 @@ class OmpThreadsForEveryEngineTest(unittest.TestCase):
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
 
-    def test_qwen38_rejects_gpu_and_vram_flags_before_binary_detection(self):
-        gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--gpu"):
-            self.coli.env_for_engine(gpu_args, "qwen38")
-        vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
-        with self.assertRaisesRegex(SystemExit, "CPU only.*--vram"):
-            self.coli.env_for_engine(vram_args, "qwen38")
+    def test_qwen38_gpu_flags_need_the_cuda_build(self):
+        """qwen38 has a GPU path now (expert tier, dense trunk), so --gpu and
+        --vram are no longer refused up front as "CPU only". On a CPU-only
+        binary they fail the way every accelerated engine's do: by asking for
+        the CUDA build. cuda_binary() is mocked so the test does not depend on
+        what happens to be built next to it."""
+        with mock.patch.object(self.coli, "cuda_binary", return_value=None):
+            gpu_args = self.args();gpu_args.gpu="0";gpu_args.vram=0
+            with self.assertRaisesRegex(SystemExit, "--gpu needs the CUDA build"):
+                self.coli.env_for_engine(gpu_args, "qwen38")
+            vram_args = self.args();vram_args.gpu=None;vram_args.vram=4
+            with self.assertRaisesRegex(SystemExit, "--vram needs the CUDA build"):
+                self.coli.env_for_engine(vram_args, "qwen38")
 
 
 class ContextFlagHonestyTest(unittest.TestCase):

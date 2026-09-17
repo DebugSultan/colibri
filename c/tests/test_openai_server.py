@@ -2588,8 +2588,10 @@ class ReasoningEffortTest(unittest.TestCase):
 
 
 class ImageUrlPathGuard(unittest.TestCase):
-    """image_url.url points at a local file read with the server's rights.
-    A '..' path is refused; COLI_IMAGE_ROOT confines reads; errors stay
+    """image_url.url naming a local file is read with the server's rights, so
+    it is denied unless the operator sets COLI_IMAGE_ROOT, and then only
+    inside it (GHSA follow-up to #1354, whose guards left every absolute path
+    readable by default). data: URIs are the client's way in. Errors stay
     generic so a reply never confirms a path or its permissions."""
 
     def setUp(self):
@@ -2600,31 +2602,62 @@ class ImageUrlPathGuard(unittest.TestCase):
         if self._saved is not None:
             os.environ["COLI_IMAGE_ROOT"] = self._saved
 
-    def test_reads_a_plain_file_by_default(self):
+    def test_data_uri_is_the_default_way_in(self):
+        import base64
+        payload = base64.b64encode(b"\x89PNG\r\n").decode()
+        self.assertEqual(_image_bytes_from_url("data:image/png;base64," + payload), b"\x89PNG\r\n")
+
+    def test_local_paths_are_denied_by_default(self):
         with tempfile.TemporaryDirectory() as root:
             img = Path(root) / "pic.png"
             img.write_bytes(b"\x89PNG\r\n")
-            self.assertEqual(_image_bytes_from_url(str(img)), b"\x89PNG\r\n")
-            self.assertEqual(_image_bytes_from_url("file://" + str(img)),
-                             b"\x89PNG\r\n")
+            for url in (str(img), "file://" + str(img), "/etc/passwd", "file:///etc/passwd", "relative.png"):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertIn("COLI_IMAGE_ROOT", str(caught.exception))
+                self.assertNotIn("passwd", str(caught.exception))
 
-    def test_dotdot_is_refused(self):
-        with self.assertRaises(APIError) as caught:
-            _image_bytes_from_url("/var/data/../../etc/passwd")
-        self.assertEqual(caught.exception.status, 400)
-        self.assertNotIn("passwd", str(caught.exception))
-
-    def test_image_root_confines_reads(self):
+    def test_image_root_allows_inside_and_refuses_outside(self):
         with tempfile.TemporaryDirectory() as root, \
-                tempfile.NamedTemporaryFile() as outside:
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
             os.environ["COLI_IMAGE_ROOT"] = root
             inside = Path(root) / "ok.png"
             inside.write_bytes(b"ok")
             self.assertEqual(_image_bytes_from_url(str(inside)), b"ok")
+            self.assertEqual(_image_bytes_from_url("file://" + str(inside)), b"ok")
+            for url in (outside.name, "/etc/passwd", str(Path(root) / ".." / Path(outside.name).name)):
+                with self.assertRaises(APIError) as caught:
+                    _image_bytes_from_url(url)
+                self.assertNotIn(Path(outside.name).name, str(caught.exception))
+
+    def test_a_symlink_escaping_the_root_is_refused(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks here")
+        with tempfile.TemporaryDirectory() as root, \
+                tempfile.NamedTemporaryFile(suffix=".png") as outside:
+            os.environ["COLI_IMAGE_ROOT"] = root
+            link = Path(root) / "link.png"
+            try:
+                os.symlink(outside.name, link)
+            except OSError:
+                self.skipTest("cannot create symlinks here")
             with self.assertRaises(APIError):
-                _image_bytes_from_url(outside.name)
+                _image_bytes_from_url(str(link))
+
+    def test_a_missing_or_file_root_denies_everything(self):
+        with tempfile.TemporaryDirectory() as root:
+            img = Path(root) / "pic.png"
+            img.write_bytes(b"x")
+            os.environ["COLI_IMAGE_ROOT"] = str(Path(root) / "nowhere")
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
+            os.environ["COLI_IMAGE_ROOT"] = str(img)
+            with self.assertRaises(APIError):
+                _image_bytes_from_url(str(img))
 
     def test_error_does_not_leak_the_path(self):
+        os.environ["COLI_IMAGE_ROOT"] = tempfile.gettempdir()
         with self.assertRaises(APIError) as caught:
             _image_bytes_from_url("/no/such/secret-name.png")
         self.assertNotIn("secret-name", str(caught.exception))

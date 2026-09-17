@@ -5220,6 +5220,20 @@ static int router_best_or_fallback(int best, int kk, int E, int layer){
     return kk<E ? kk : 0;
 }
 
+/* Select distinct router choices in-place. Marking a selected score removes the
+ * O(K) prefix scan from every pick while preserving the existing fallback for
+ * non-finite logits. `choice` is rebuilt for each routed row, so mutating it is
+ * local to this selection pass. */
+static void router_select_topk(float *choice, int E, int K, int *idx, int layer){
+    for(int kk=0;kk<K;kk++){
+        int best=-1; float bv=-1e30f;
+        for(int e=0;e<E;e++) if(choice[e]>bv){ bv=choice[e]; best=e; }
+        best=router_best_or_fallback(best,kk,E,layer);
+        idx[kk]=best;
+        choice[best]=-1e30f;
+    }
+}
+
 #ifdef COLI_METAL
 /* Rotate the Metal-staged gate/up input rows for fmt=6 (Q^T x). Duplicate rows
  * (same source s) are copied from the first rotated instance: O(p^2) scan, p<=65. */
@@ -5346,24 +5360,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_route_p>0.f && g_route_p<1.f){
                 /* Cumulative-mass variant: grow M until mass covers ROUTE_P. */
                 int Mmax=g_route_m>Ksel*4?g_route_m:Ksel*4; if(Mmax>E) Mmax=E; if(Mmax>rank_cap) Mmax=rank_cap;
-                for(int kk=0;kk<Mmax;kk++){ int best=-1; float bv=-1e30f;
-                    for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
-                        if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-                    best=router_best_or_fallback(best,kk,E,layer);
-                    rank_buf[kk]=best; rank_w[kk]=logit[best];
-                }
+                router_select_topk(choice,E,Mmax,rank_buf,layer);
+                for(int kk=0;kk<Mmax;kk++) rank_w[kk]=logit[rank_buf[kk]];
                 float tot=1e-20f; for(int kk=0;kk<Mmax;kk++) tot+=rank_w[kk]>0?rank_w[kk]:0;
                 float cum=0; Mwin=Ksel;
                 for(int kk=0;kk<Mmax;kk++){ cum+=rank_w[kk]>0?rank_w[kk]:0;
                     if(cum>=g_route_p*tot){ Mwin=kk+1; break; } Mwin=kk+1; }
                 if(Mwin<Ksel) Mwin=Ksel;
             } else {
-                for(int kk=0;kk<Mwin;kk++){ int best=-1; float bv=-1e30f;
-                    for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
-                        if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-                    best=router_best_or_fallback(best,kk,E,layer);
-                    rank_buf[kk]=best; rank_w[kk]=logit[best];
-                }
+                router_select_topk(choice,E,Mwin,rank_buf,layer);
+                for(int kk=0;kk<Mwin;kk++) rank_w[kk]=logit[rank_buf[kk]];
             }
             int J=g_route_j; if(J<0) J=0; if(J>Ksel) J=Ksel;
             int chosen=0;
@@ -5427,12 +5433,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->route_kl_sum+=kl; m->route_kl_n++;
             }
         } else {
-            for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-                for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
-                best=router_best_or_fallback(best,kk,E,layer);
-                idx[kk]=best; w[kk]=logit[best];
-            }
+            router_select_topk(choice,E,Ksel,idx,layer);
+            for(int kk=0;kk<Ksel;kk++) w[kk]=logit[idx[kk]];
             if(g_route_agree){
                 m->route_agree_hit+=(uint64_t)Ksel;
                 m->route_agree_tot+=(uint64_t)Ksel;
@@ -11398,6 +11400,43 @@ int main(int argc, char **argv){
     { double ram_env = getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
       int est_ctx = getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default di run_serve */
       snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
+#ifdef COLI_VULKAN
+      /* #653's correction, for the Vulkan tier. On an integrated GPU the tier's
+       * HOST_VISIBLE|DEVICE_LOCAL allocation is the SAME physical RAM that
+       * expert_avail()/cap_for_ram() below hand to the pin set and the LRU.
+       * Unlike the CUDA tier this one cannot be subtracted after the fact:
+       * vk_registry_fill() runs at the END of init, long after both decisions
+       * are made, so the planned size has to be reserved here instead. Sized
+       * from a routed layer's row width x the configured expert count.
+       * Discrete GPUs have their own pool -> deviceType is not INTEGRATED and
+       * this is a no-op, as with #653. */
+      if(g_vulkan && g_vk_budget>0 && g_mem_avail_boot>0 && coli_vk_device_integrated()){
+          int probe_l = m.c.n_layers>1 ? m.c.n_layers/2 : 0;
+          double per = (double)expert_bytes_row(&m,probe_l,m.ebits);
+          double tier_gb = per>0 ? (double)g_vk_budget*per/1e9 : 0.0;
+          /* COLI_VK_EXPERTS is a REQUEST, not a placement: vk_registry_fill() stops
+           * early when the device-local budget runs out (COLI_VK_RESERVE_GB), so
+           * pricing the request would over-reserve badly -- measured 95.6 GB reserved
+           * against 66.0 GB actually placed at 4500, and at 6000 the unclamped
+           * reservation starved MemAvailable to the 1 GB floor and killed the run.
+           * Clamp to what the device can actually take, and never take so much that
+           * the host side has nothing left to plan with. */
+          double vk_used=0, vk_bud=0;
+          if(tier_gb>0 && coli_vk_mem_budget(&vk_used,&vk_bud) && vk_bud>vk_used){
+              double reserve = getenv("COLI_VK_RESERVE_GB")?atof(getenv("COLI_VK_RESERVE_GB")):3.0;
+              double placeable = vk_bud - vk_used - reserve;
+              if(placeable>0 && tier_gb>placeable) tier_gb = placeable;
+          }
+          double host_floor = g_mem_avail_boot*0.35;      /* the planner keeps at least this */
+          if(tier_gb > g_mem_avail_boot - host_floor) tier_gb = g_mem_avail_boot - host_floor;
+          if(tier_gb>0){
+              g_mem_avail_boot -= tier_gb;
+              fprintf(stderr,"[VK] integrated/unified memory: expert tier will share physical RAM; "
+                  "RAM budget snapshot reduced by %.2f GB (%d experts requested) -> MemAvailable=%.1f GB\n",
+                  tier_gb, g_vk_budget, g_mem_avail_boot);
+          }
+      }
+#endif
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] expert history: %lld selections (%s)\n",(long long)hist,g_usage_path);
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
