@@ -1,7 +1,7 @@
 /* q38t_fill_wait() returns before the last upload has landed.
  *
  * The defect (upstream #1360's class, fixed in qwen36_tier by df44b87):
- * q38t_fill_wait waited for the upload QUEUE to drain (G.qn == 0). The
+ * q38t_fill_wait waited for the upload QUEUE to drain (VTG.qn == 0). The
  * uploader frees the ring slot when it DEQUEUES an entry, before it calls
  * the backend, so the queue is empty while the last expert is still being
  * copied to the device. Whoever called q38t_fill_wait then sees that expert
@@ -67,9 +67,9 @@ int main(void) {
      * returns: nothing is still queued, and everything we enqueued is
      * resident. No polling, no sleeping -- the wait IS the guarantee. */
     int queued = 0, resident = 0;
-    pthread_mutex_lock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
     for (int eid = 0; eid < NE; eid++) { queued += qs(0, eid)->queued; resident += qs(0, eid)->resident; }
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
     check(queued == 0, "an expert is still queued when q38t_fill_wait returns");
     check(resident == NE, "not every enqueued expert is resident when q38t_fill_wait returns");
     check(fake_uploads == 3 * NE, "each expert should have uploaded exactly three tensors by the time the wait returns");

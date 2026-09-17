@@ -59,8 +59,8 @@ int main(void) {
         return 1;
     }
     size_t payload = 3u * (D * IH) + 3u * SC * sizeof(float);
-    check(G.exp_bytes == payload, "the charge is not the exact payload");
-    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
+    check(VTG.exp_bytes == payload, "the charge is not the exact payload");
+    check(VTG.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
           "the arena budget is not slot-aligned to the headroom");
     q38t_shutdown();
 
@@ -70,7 +70,7 @@ int main(void) {
         printf("  FAIL: init with an over-large explicit budget\n");
         return 1;
     }
-    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
+    check(VTG.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
           "an explicit budget above the headroom was not clamped to it");
     q38t_shutdown();
     setenv("CUDA_EXPERT_GB", "1", 1);
@@ -78,7 +78,7 @@ int main(void) {
         printf("  FAIL: init with an explicit budget below the headroom\n");
         return 1;
     }
-    check(G.budget[0] == ((size_t)1 << 30) / payload * payload,
+    check(VTG.budget[0] == ((size_t)1 << 30) / payload * payload,
           "an explicit budget under the headroom was not honoured");
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
@@ -93,7 +93,7 @@ int main(void) {
         printf("  FAIL: init with a parametric reserve\n");
         return 1;
     }
-    check(G.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
+    check(VTG.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
           "Q38T_DEV_RESERVE_MB did not move the auto budget");
     q38t_shutdown();
 
@@ -102,7 +102,7 @@ int main(void) {
         printf("  FAIL: init with an explicit budget over a parametric reserve\n");
         return 1;
     }
-    check(G.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
+    check(VTG.budget[0] == (fake_free_bytes - ((size_t)16 << 20)) / payload * payload,
           "the explicit budget was not clamped to the parametric headroom");
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
@@ -112,7 +112,7 @@ int main(void) {
         printf("  FAIL: init with a junk reserve override\n");
         return 1;
     }
-    check(G.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
+    check(VTG.budget[0] == (fake_free_bytes - Q38T_DEV_RESERVE) / payload * payload,
           "a junk Q38T_DEV_RESERVE_MB did not fall back to the default");
     q38t_shutdown();
     unsetenv("Q38T_DEV_RESERVE_MB");
@@ -124,7 +124,7 @@ int main(void) {
         printf("  FAIL: init with the singular COLI_GPU\n");
         return 1;
     }
-    check(G.ndev == 1 && G.dev[0] == 0, "COLI_GPU=0 did not select device 0");
+    check(VTG.ndev == 1 && VTG.dev[0] == 0, "COLI_GPU=0 did not select device 0");
     q38t_shutdown();
     setenv("COLI_GPUS", "0", 1);
     unsetenv("COLI_GPU");
@@ -139,10 +139,10 @@ int main(void) {
         q38t_offer(0, eid, g[eid], u[eid], d[eid], sc[eid], 0);
     q38t_fill_wait();
     check(fake_uploads - u0 == 3 * NE, "the uploads did not all complete");
-    pthread_mutex_lock(&G.mx);
-    check(G.used[0] == (size_t)NE * G.exp_bytes, "used[0] does not match eight resident experts");
-    check(G.used[0] <= G.budget[0], "used[0] exceeds the budget");
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
+    check(VTG.used[0] == (size_t)NE * VTG.exp_bytes, "used[0] does not match eight resident experts");
+    check(VTG.used[0] <= VTG.budget[0], "used[0] exceeds the budget");
+    pthread_mutex_unlock(&VTG.mx);
     check(resident_count(0) == NE, "not every offered expert is resident");
     q38t_shutdown();
 
@@ -170,11 +170,11 @@ int main(void) {
     for (int i = 1; i < n; i++)
         q38t_offer(L[i], E[i], g[E[i]], u[E[i]], d[E[i]], sc[E[i]], 1);
     q38t_fill_wait();
-    pthread_mutex_lock(&G.mx);
-    check(G.used[0] == (size_t)(n - 1) * G.exp_bytes,
+    pthread_mutex_lock(&VTG.mx);
+    check(VTG.used[0] == (size_t)(n - 1) * VTG.exp_bytes,
           "the cancelled reservation was not released");
-    check(G.used[0] <= G.budget[0], "planned offers pushed used[] past the budget");
-    pthread_mutex_unlock(&G.mx);
+    check(VTG.used[0] <= VTG.budget[0], "planned offers pushed used[] past the budget");
+    pthread_mutex_unlock(&VTG.mx);
     check(resident_count(0) == n - 1, "the planned residents do not match the plan minus the cancellation");
     q38t_shutdown();
 
@@ -188,7 +188,7 @@ int main(void) {
         printf("  FAIL: init with an arena sized to exactly NE slots\n");
         return 1;
     }
-    check(G.budget[0] >= (size_t)NE * G.exp_bytes && G.budget[0] < (size_t)(NE + 1) * G.exp_bytes,
+    check(VTG.budget[0] >= (size_t)NE * VTG.exp_bytes && VTG.budget[0] < (size_t)(NE + 1) * VTG.exp_bytes,
           "the tuned budget did not land on exactly NE arena slots");
     int L1[NE], E1[NE];
     int n1 = q38t_plan_fill(L1, E1, NE);
@@ -196,16 +196,16 @@ int main(void) {
     for (int i = 0; i < n1; i++) q38t_cancel_plan(L1[i], E1[i]);
     /* Direct on the free-list: plan_fill's cursor is single-shot, so a
      * second plan cannot re-cover the ground -- the free count is the truth. */
-    check(G.slot_free_n[0] == (int)(G.budget[0] / G.exp_bytes),
+    check(VTG.slot_free_n[0] == (int)(VTG.budget[0] / VTG.exp_bytes),
           "the cancelled slots were not given back to the arena");
-    check(G.used[0] == 0, "the cancelled charges were not released");
+    check(VTG.used[0] == 0, "the cancelled charges were not released");
     q38t_shutdown();
     unsetenv("CUDA_EXPERT_GB");
 
     unsetenv("HEAT_FILE");
     remove(tmp_heat);
 
-    /* --- 5. two devices: the home split halves the bookkeeping ----------- */
+    /* --- 5. two devices: the vt_home split halves the bookkeeping ----------- */
     fake_ndev = 2;
     setenv("COLI_GPUS", "0,1", 1);
     if (!q38t_init(NL, NE, D, IH, TOPK, SC, 1, 8, 0)) {
@@ -215,10 +215,10 @@ int main(void) {
     for (int eid = 0; eid < NE; eid++)
         q38t_offer(0, eid, g[eid], u[eid], d[eid], sc[eid], 0);
     q38t_fill_wait();
-    pthread_mutex_lock(&G.mx);
-    check(G.used[0] == (size_t)(NE / 2) * G.exp_bytes && G.used[1] == (size_t)(NE / 2) * G.exp_bytes,
-          "the eid%%ndev home split did not halve the per-device bytes");
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
+    check(VTG.used[0] == (size_t)(NE / 2) * VTG.exp_bytes && VTG.used[1] == (size_t)(NE / 2) * VTG.exp_bytes,
+          "the eid%%ndev vt_home split did not halve the per-device bytes");
+    pthread_mutex_unlock(&VTG.mx);
     q38t_shutdown();
     fake_ndev = 1;
     setenv("COLI_GPUS", "0", 1);
@@ -238,9 +238,9 @@ int main(void) {
             printf("  FAIL: the int4 tier should start without native fp8\n");
             return 1;
         }
-        check(G.fmt == 4 && G.gs == GS4, "the tier did not record fmt=4/gs");
-        check(G.mat_bytes == (size_t)D * IH / 2, "int4 matrix bytes are not nibble-packed");
-        check(G.exp_bytes == 3u * ((size_t)D * IH / 2) + 3u * SC4 * sizeof(float),
+        check(VTG.fmt == 4 && VTG.gs == GS4, "the tier did not record fmt=4/gs");
+        check(VTG.mat_bytes == (size_t)D * IH / 2, "int4 matrix bytes are not nibble-packed");
+        check(VTG.exp_bytes == 3u * ((size_t)D * IH / 2) + 3u * SC4 * sizeof(float),
               "int4 exp_bytes is not the nibble+scale payload");
 
         int u4 = fake_uploads;

@@ -47,7 +47,12 @@ extern "C" {
  * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
  * decode through. */
 static inline int coli_cuda_weight_at_supported(int fmt) {
-    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4 || fmt == 9;
+    /* Our fmt=9 (bf16 dense, 46dc695) had been admitted here; that made the
+     * predicate answer "may this tensor live on the device", while every
+     * caller (absorb_fmt_ok) means "can weight_at decode it". The bf16 dense
+     * rides coli_cuda_matmul's own device branch, never the absorb kernels,
+     * so the set is upstream's again and tests/test_cuda_fmt_guard pins it. */
+    return fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 4;
 }
 
 /* Opaque, persistent device copy of one resident quantized tensor. */

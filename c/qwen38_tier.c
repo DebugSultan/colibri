@@ -48,7 +48,7 @@ static struct {
     int dev[Q38T_MAX_DEV];
     size_t budget[Q38T_MAX_DEV], used[Q38T_MAX_DEV];
     /* Expert arena: one cudaMalloc per device (pipe_alloc), slots of EXACT
-     * payload at fixed offsets, LIFO free-list under G.mx. A slot is taken
+     * payload at fixed offsets, LIFO free-list under VTG.mx. A slot is taken
      * where the budget is charged (q38t_offer / q38t_plan_fill) and given
      * back where the charge is released (cancels, upload failure); a swap
      * TRANSFERS the victim's slot to the replacement at enqueue time, so the
@@ -77,7 +77,7 @@ static struct {
     uint64_t offers, promotions, swaps, q_full_skips, overflow_rows, take_fails;
     /* Plans the engine gave back instead of offering. Cancelling is the
      * legitimate answer for a plan it cannot execute (out-of-range layer,
-     * expert in a format the tier does not stage), so it is silent -- and
+     * expert in a format the tier does not vt_stage), so it is silent -- and
      * that silence hid a mass cancellation that left the tier at 0 resident
      * with every other counter also at 0. Counted, it cannot hide again. */
     uint64_t plan_cancels;
@@ -117,10 +117,10 @@ static struct {
     /* warmstart */
     int *fill_order; int fill_n, fill_cur;
     uint32_t *heat0;
-} G;
+} VTG;
 
-static Q38TSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
-static int home(int eid){ return eid % G.ndev; }
+static Q38TSlot *qs(int layer, int eid){ return &VTG.slot[(size_t)layer*VTG.ne + eid]; }
+static int vt_home(int eid){ return eid % VTG.ndev; }
 
 /* Host-RAM pinning hooks (residenza totale): the ENGINE owns the resolution
  * (safetensors headers + mlock), the tier only owns the instants. Unlock
@@ -135,18 +135,18 @@ void q38t_set_host_pin(void (*lock_fn)(int,int), void (*unlock_fn)(int,int)){
     g_pin_lock=lock_fn; g_pin_unlock=unlock_fn;
 }
 
-/* Arena free-list. Every take and give happens under G.mx, in lockstep with
+/* Arena free-list. Every take and give happens under VTG.mx, in lockstep with
  * the budget charge it mirrors; the uploader reads only the arena_idx it
  * already owns. UINT32_MAX from arena_take means "no slot" -- the budget
  * invariant (used+exp <= budget) makes it unreachable; if it ever happens
  * the offer is dropped and counted, never served silently. */
 static uint32_t arena_take(int di){
-    if(!G.arena[di] || G.slot_free_n[di]<=0) return UINT32_MAX;
-    return G.slot_free[di][--G.slot_free_n[di]];
+    if(!VTG.arena[di] || VTG.slot_free_n[di]<=0) return UINT32_MAX;
+    return VTG.slot_free[di][--VTG.slot_free_n[di]];
 }
 static void arena_give(int di, uint32_t idx){
-    if(!G.arena[di] || idx==UINT32_MAX) return;
-    G.slot_free[di][G.slot_free_n[di]++]=idx;
+    if(!VTG.arena[di] || idx==UINT32_MAX) return;
+    VTG.slot_free[di][VTG.slot_free_n[di]++]=idx;
 }
 
 /* Reserve in bytes for one device: Q38T_DEV_RESERVE_MB (MiB), default
@@ -203,79 +203,79 @@ static uint64_t now_ns(void){
  * bills each matrix fp8_nblk(D)*fp8_nblk(Ih) floats, and fmt=4 bills
  * D*Ih/gs for all three because q38_int4_group_size only accepts a gs that
  * divides both D and Ih. */
-static void stage(uint8_t *dw, float *dsc,
+static void vt_stage(uint8_t *dw, float *dsc,
                   const uint8_t *gate, const uint8_t *up, const uint8_t *down,
                   const float *scales){
-    memcpy(dw,                  gate, G.mat_bytes);
-    memcpy(dw+G.mat_bytes,      up,   G.mat_bytes);
-    memcpy(dw+2*G.mat_bytes,    down, G.mat_bytes);
-    memcpy(dsc, scales, 3*G.sc*sizeof(float));
+    memcpy(dw,                  gate, VTG.mat_bytes);
+    memcpy(dw+VTG.mat_bytes,      up,   VTG.mat_bytes);
+    memcpy(dw+2*VTG.mat_bytes,    down, VTG.mat_bytes);
+    memcpy(dsc, scales, 3*VTG.sc*sizeof(float));
 }
 
 static void *uploader(void *arg){
     (void)arg;
     for(;;){
-        pthread_mutex_lock(&G.mx);
-        while(G.qn==0 && !G.th_stop) pthread_cond_wait(&G.cv,&G.mx);
-        if(G.th_stop && G.qn==0){ pthread_mutex_unlock(&G.mx); return NULL; }
-        int layer=G.q[G.qh].layer, eid=G.q[G.qh].eid;
-        int vl=G.q[G.qh].v_layer, ve=G.q[G.qh].v_eid;
-        uint8_t *w=G.q[G.qh].w; float *sc=G.q[G.qh].s;
-        G.qh=(G.qh+1)%Q38T_QCAP; G.qn--;
-        pthread_cond_broadcast(&G.cv_take);          /* queue space */
+        pthread_mutex_lock(&VTG.mx);
+        while(VTG.qn==0 && !VTG.th_stop) pthread_cond_wait(&VTG.cv,&VTG.mx);
+        if(VTG.th_stop && VTG.qn==0){ pthread_mutex_unlock(&VTG.mx); return NULL; }
+        int layer=VTG.q[VTG.qh].layer, eid=VTG.q[VTG.qh].eid;
+        int vl=VTG.q[VTG.qh].v_layer, ve=VTG.q[VTG.qh].v_eid;
+        uint8_t *w=VTG.q[VTG.qh].w; float *sc=VTG.q[VTG.qh].s;
+        VTG.qh=(VTG.qh+1)%Q38T_QCAP; VTG.qn--;
+        pthread_cond_broadcast(&VTG.cv_take);          /* queue space */
         if(ve>=0){
             /* swap: the victim is freed only when no group is in flight */
-            while(G.issue_open && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
+            while(VTG.issue_open && !VTG.th_stop) pthread_cond_wait(&VTG.cv_take,&VTG.mx);
             Q38TSlot *v=qs(vl,ve);
-            if(G.th_stop && G.issue_open){
+            if(VTG.th_stop && VTG.issue_open){
                  /* Shutdown with a group still open: q38t_take, the only thing
                   * that clears issue_open, will never come. The swap is
                   * abandoned instead of freeing a tensor the group in flight
                   * can still read; the resident flag had already been turned
                   * off by the one who queued, so it is put back the way it
                   * was. */
-                v->resident=1; qs(layer,eid)->queued=0; G.inflight--;
-                pthread_cond_broadcast(&G.cv_take);
-                pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
+                v->resident=1; qs(layer,eid)->queued=0; VTG.inflight--;
+                pthread_cond_broadcast(&VTG.cv_take);
+                pthread_mutex_unlock(&VTG.mx); free(w); free(sc); continue;
             }
             ColiCudaTensor *a=v->tg,*b=v->tu,*c=v->td;
             v->tg=v->tu=v->td=NULL;
-            pthread_mutex_unlock(&G.mx);
+            pthread_mutex_unlock(&VTG.mx);
             /* The tensors own nothing (arena), so this frees descriptors and
              * accounting only. The victim's slot is NOT returned: it was
              * transferred to the replacement at enqueue time. */
             if(a)coli_cuda_tensor_free(a);
             if(b)coli_cuda_tensor_free(b);
             if(c)coli_cuda_tensor_free(c);
-        } else pthread_mutex_unlock(&G.mx);
+        } else pthread_mutex_unlock(&VTG.mx);
 
-        int dv=G.dev[home(eid)];
+        int dv=VTG.dev[vt_home(eid)];
         uint32_t aidx=qs(layer,eid)->arena_idx;
-        uint8_t *slotw=G.arena[home(eid)] + (size_t)aidx*G.exp_bytes;
-        float *slotsc=(float*)(slotw + 3*G.mat_bytes);
+        uint8_t *slotw=VTG.arena[vt_home(eid)] + (size_t)aidx*VTG.exp_bytes;
+        float *slotsc=(float*)(slotw + 3*VTG.mat_bytes);
         /* gate/up are [inter,hidden], down is [hidden,inter]; the signature
          * wants (I=input, O=output), not (rows, columns). The arena slot is
          * [gate|up|down][s_gate|s_up|s_down] at exact payload offsets. */
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
-        int ok = coli_cuda_tensor_upload_into(&tg, w,               sc,        G.fmt, G.D,  G.Ih, dv, G.gs, slotw,                 slotsc)
-              && coli_cuda_tensor_upload_into(&tu, w+G.mat_bytes,   sc+G.sc,   G.fmt, G.D,  G.Ih, dv, G.gs, slotw+G.mat_bytes,     slotsc+G.sc)
-              && coli_cuda_tensor_upload_into(&td, w+2*G.mat_bytes, sc+2*G.sc, G.fmt, G.Ih, G.D,  dv, G.gs, slotw+2*G.mat_bytes,   slotsc+2*G.sc);
+        int ok = coli_cuda_tensor_upload_into(&tg, w,               sc,        VTG.fmt, VTG.D,  VTG.Ih, dv, VTG.gs, slotw,                 slotsc)
+              && coli_cuda_tensor_upload_into(&tu, w+VTG.mat_bytes,   sc+VTG.sc,   VTG.fmt, VTG.D,  VTG.Ih, dv, VTG.gs, slotw+VTG.mat_bytes,     slotsc+VTG.sc)
+              && coli_cuda_tensor_upload_into(&td, w+2*VTG.mat_bytes, sc+2*VTG.sc, VTG.fmt, VTG.Ih, VTG.D,  dv, VTG.gs, slotw+2*VTG.mat_bytes,   slotsc+2*VTG.sc);
         free(w); free(sc);
-        pthread_mutex_lock(&G.mx);
+        pthread_mutex_lock(&VTG.mx);
         Q38TSlot *s=qs(layer,eid);
-        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; }
-        else  { int hd=home(eid);
-                G.upload_fail++;
-                if(G.used[hd]>=G.exp_bytes) G.used[hd]-=G.exp_bytes;
-                G.budget[hd]=G.used[hd];   /* card really full: stop */
+        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; VTG.uploads++; }
+        else  { int hd=vt_home(eid);
+                VTG.upload_fail++;
+                if(VTG.used[hd]>=VTG.exp_bytes) VTG.used[hd]-=VTG.exp_bytes;
+                VTG.budget[hd]=VTG.used[hd];   /* card really full: stop */
                 arena_give(hd,aidx);
                 if(tg)coli_cuda_tensor_free(tg);
                 if(tu)coli_cuda_tensor_free(tu);
                 if(td)coli_cuda_tensor_free(td); }
         s->queued=0; s->planned=0;
-        G.inflight--;
-        pthread_cond_broadcast(&G.cv_take);          /* this upload is complete */
-        pthread_mutex_unlock(&G.mx);
+        VTG.inflight--;
+        pthread_cond_broadcast(&VTG.cv_take);          /* this upload is complete */
+        pthread_mutex_unlock(&VTG.mx);
         /* Promotion complete: unpin the expert's host pages. Fired outside
          * the mutex -- mlock/munlock can wait on I/O, the tier mutex never
          * must. */
@@ -343,7 +343,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
               int native_fp8, int fmt, int gs){
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
-    if(G.on){
+    if(VTG.on){
         /* Process singleton: the slots are sized for ONE geometry. A second
          * model (Segment adapter) cannot share them, so it is told no and
          * stays on CPU. That is why the engine remembers the return of this
@@ -364,8 +364,8 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     }
     if(fmt==4){
         /* The group size has to divide both axes, or the three matrices do
-         * not bill the same number of scales and the single G.sc stride in
-         * stage() and in the uploader would be wrong. q38_int4_group_size
+         * not bill the same number of scales and the single VTG.sc stride in
+         * vt_stage() and in the uploader would be wrong. q38_int4_group_size
          * already refuses anything else at load time; this is the tier's own
          * check, because a tier that silently stages the wrong stride is the
          * defect class that costs a whole window. */
@@ -384,15 +384,15 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
         fprintf(stderr,"[q38tier] topk=%d unsupported\n",topk); return 0;
     }
     if(nl<1||ne<1||D<1||Ih<1||scale_count<1) return 0;
-    memset(&G,0,sizeof G);
-    G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk; G.sc=(size_t)scale_count;
-    G.fmt=fmt; G.gs=(fmt==4)?gs:0;
-    G.mat_bytes=(fmt==4) ? (size_t)D*(size_t)Ih/2 : (size_t)D*(size_t)Ih;
+    memset(&VTG,0,sizeof VTG);
+    VTG.nl=nl; VTG.ne=ne; VTG.D=D; VTG.Ih=Ih; VTG.topk=topk; VTG.sc=(size_t)scale_count;
+    VTG.fmt=fmt; VTG.gs=(fmt==4)?gs:0;
+    VTG.mat_bytes=(fmt==4) ? (size_t)D*(size_t)Ih/2 : (size_t)D*(size_t)Ih;
     /* The charge is the exact payload: the arena (below) stores experts at
      * fixed offsets with no per-allocation rounding, so the budget counts
      * real bytes. The old footprint charge billed 3.33 MiB for a 2.64 MiB
      * int4 expert -- ~1900 experts per card lost to cudaMalloc granularity. */
-    G.exp_bytes = 3*G.mat_bytes + 3*G.sc*sizeof(float);
+    VTG.exp_bytes = 3*VTG.mat_bytes + 3*VTG.sc*sizeof(float);
 
     /* Devices: COLI_GPUS="0,1" (default: first two visible devices).
      * COLI_GPU is the singular the planner writes for a one-device plan;
@@ -402,27 +402,27 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
     if(!gl || !*gl) gl=getenv("COLI_GPU");
     if(gl && *gl){
         char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
-        for(char *t=strtok(buf,","); t && G.ndev<Q38T_MAX_DEV; t=strtok(NULL,","))
-            G.dev[G.ndev++]=atoi(t);
+        for(char *t=strtok(buf,","); t && VTG.ndev<Q38T_MAX_DEV; t=strtok(NULL,","))
+            VTG.dev[VTG.ndev++]=atoi(t);
     } else {
         int available=coli_cuda_available_device_count();
         int want=available<2?available:2;
-        for(int i=0;i<want && i<Q38T_MAX_DEV;i++) G.dev[G.ndev++]=i;
-        fprintf(stderr,"[q38tier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
+        for(int i=0;i<want && i<Q38T_MAX_DEV;i++) VTG.dev[VTG.ndev++]=i;
+        fprintf(stderr,"[q38tier] COLI_GPUS unset: selecting %d visible device(s)\n",VTG.ndev);
     }
-    if(G.ndev<1){ fprintf(stderr,"[q38tier] no visible CUDA devices -> CPU path\n"); return 0; }
+    if(VTG.ndev<1){ fprintf(stderr,"[q38tier] no visible CUDA devices -> CPU path\n"); return 0; }
     q38t_affmask aff; q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* CUDA's threads are born here */
-    if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[q38tier] coli_cuda_init failed -> CPU path\n"); return 0; }
+    if(!coli_cuda_init(VTG.dev,VTG.ndev)){ fprintf(stderr,"[q38tier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
-    if(have<G.ndev) G.ndev=have;
-    if(G.ndev<1){ fprintf(stderr,"[q38tier] no CUDA devices -> CPU path\n"); return 0; }
+    if(have<VTG.ndev) VTG.ndev=have;
+    if(VTG.ndev<1){ fprintf(stderr,"[q38tier] no CUDA devices -> CPU path\n"); return 0; }
 
     /* The e4m3 LUT must be published BEFORE any fmt=8 upload: without it,
      * the backend refuses them instead of decoding against a table of zeros.
      * fmt=4 never decodes e4m3, so a failure there is not fatal -- it is
      * published anyway because the backend is process-wide and the cost is a
      * 1 KiB copy. */
-    if(!coli_cuda_fp8_set_lut(E4M3_LUT) && G.fmt==8){
+    if(!coli_cuda_fp8_set_lut(E4M3_LUT) && VTG.fmt==8){
         fprintf(stderr,"[q38tier] coli_cuda_fp8_set_lut failed -> CPU path\n");
         return 0;
     }
@@ -432,7 +432,7 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * It used to be the cudaMalloc footprint (3.33 MiB billed for a 2.64 MiB
      * int4 expert): honest while each expert was six separate cudaMallocs,
      * and the over-commit froze budgets permanently via the clamp
-     * (G.budget[hd]=G.used[hd] in the uploader). The arena below removes the
+     * (VTG.budget[hd]=VTG.used[hd] in the uploader). The arena below removes the
      * rounding itself, so the charge follows it: real bytes, no slack. */
     /* How much VRAM to leave to the backend. One GiB was an eyeball estimate,
      * and it is measured wrong: the backend allocates its work tensors and
@@ -447,9 +447,9 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * watching upload_fail) because in prefill the backend takes ~200 MB per
      * card, and the reserve is worth ~1900 experts per GiB. */
     const char *bg=getenv("CUDA_EXPERT_GB");
-    for(int i=0;i<G.ndev;i++){
-        size_t reserve=dev_reserve_for(G.dev[i]);
-        size_t freeb=0,totb=0; coli_cuda_mem_info(G.dev[i],&freeb,&totb);
+    for(int i=0;i<VTG.ndev;i++){
+        size_t reserve=dev_reserve_for(VTG.dev[i]);
+        size_t freeb=0,totb=0; coli_cuda_mem_info(VTG.dev[i],&freeb,&totb);
         /* An explicit budget above what the card can still take made every
          * upload fail until the uploader's clamp kicked in (#1411's lesson):
          * the ceiling is min(requested, measured headroom), and the banner
@@ -461,14 +461,14 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
         if(b>headroom){
             fprintf(stderr,"[q38tier] dev %d: explicit budget %.1f GB above the "
                            "measured headroom %.1f GB, clamped\n",
-                    G.dev[i], b/1073741824.0, headroom/1073741824.0);
+                    VTG.dev[i], b/1073741824.0, headroom/1073741824.0);
             b=headroom;
         }
-        G.budget[i]=b;
+        VTG.budget[i]=b;
         fprintf(stderr,"[q38tier] dev %d: %.1f GB free, reserve %.2f GiB, "
                        "budget %.1f GB (~%zu experts)\n",
-                G.dev[i], freeb/1073741824.0, reserve/1073741824.0,
-                b/1073741824.0, b/G.exp_bytes);
+                VTG.dev[i], freeb/1073741824.0, reserve/1073741824.0,
+                b/1073741824.0, b/VTG.exp_bytes);
     }
     /* Arena: exact payload slots instead of six rounded cudaMallocs per
      * expert (dev_alloc_footprint bills 3.33 MiB for a 2.64 MiB int4 expert,
@@ -479,41 +479,41 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
      * if any card's arena fails, the tier declines -> CPU path, the same
      * answer as any other backend failure. */
     {
-        size_t payload = 3*G.mat_bytes + 3*G.sc*sizeof(float);
+        size_t payload = 3*VTG.mat_bytes + 3*VTG.sc*sizeof(float);
         int ok = 1;
-        for(int i=0;i<G.ndev && ok;i++){
-            size_t slots = G.budget[i] / payload;
-            G.arena[i] = slots ? coli_cuda_pipe_alloc(G.dev[i], slots*payload) : NULL;
-            G.slot_free[i] = slots ? malloc(slots*sizeof(uint32_t)) : NULL;
-            ok = G.arena[i] && G.slot_free[i];
+        for(int i=0;i<VTG.ndev && ok;i++){
+            size_t slots = VTG.budget[i] / payload;
+            VTG.arena[i] = slots ? coli_cuda_pipe_alloc(VTG.dev[i], slots*payload) : NULL;
+            VTG.slot_free[i] = slots ? malloc(slots*sizeof(uint32_t)) : NULL;
+            ok = VTG.arena[i] && VTG.slot_free[i];
             if(ok){
-                G.slot_free_n[i] = (int)slots;
-                for(size_t k=0;k<slots;k++) G.slot_free[i][k]=(uint32_t)k;
-                G.budget[i] = slots*payload;      /* exact charge from here on */
+                VTG.slot_free_n[i] = (int)slots;
+                for(size_t k=0;k<slots;k++) VTG.slot_free[i][k]=(uint32_t)k;
+                VTG.budget[i] = slots*payload;      /* exact charge from here on */
                 fprintf(stderr,"[q38tier] dev %d: arena %zu slots x %.2f MB payload"
                                " (the old six-cudaMalloc charge was 3.33 MB/expert)\n",
-                        G.dev[i], slots, payload/1048576.0);
+                        VTG.dev[i], slots, payload/1048576.0);
             }
         }
         if(!ok){
-            for(int i=0;i<G.ndev;i++){
-                if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
-                free(G.slot_free[i]);
-                G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+            for(int i=0;i<VTG.ndev;i++){
+                if(VTG.arena[i]) coli_cuda_pipe_free(VTG.dev[i],VTG.arena[i]);
+                free(VTG.slot_free[i]);
+                VTG.arena[i]=NULL; VTG.slot_free[i]=NULL; VTG.slot_free_n[i]=0;
             }
             fprintf(stderr,"[q38tier] arena alloc failed -> CPU path\n");
             return 0;   /* nothing else allocated yet: same as the early outs */
         }
     }
-    G.slot=calloc((size_t)nl*ne,sizeof(Q38TSlot));
-    G.is_x_floats=(size_t)G.ndev*Q38T_MAX_ROWS*D;
-    G.is_x=malloc(G.is_x_floats*sizeof(float));
-    if(!G.slot||!G.is_x){
-        free(G.slot); free(G.is_x);
-        for(int i=0;i<G.ndev;i++){
-            if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
-            free(G.slot_free[i]);
-            G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+    VTG.slot=calloc((size_t)nl*ne,sizeof(Q38TSlot));
+    VTG.is_x_floats=(size_t)VTG.ndev*Q38T_MAX_ROWS*D;
+    VTG.is_x=malloc(VTG.is_x_floats*sizeof(float));
+    if(!VTG.slot||!VTG.is_x){
+        free(VTG.slot); free(VTG.is_x);
+        for(int i=0;i<VTG.ndev;i++){
+            if(VTG.arena[i]) coli_cuda_pipe_free(VTG.dev[i],VTG.arena[i]);
+            free(VTG.slot_free[i]);
+            VTG.arena[i]=NULL; VTG.slot_free[i]=NULL; VTG.slot_free_n[i]=0;
         }
         return 0;
     }
@@ -525,104 +525,104 @@ int q38t_init(int nl, int ne, int D, int Ih, int topk, int scale_count,
             uint32_t hdr[3]={0,0,0};
             if(fread(hdr,4,3,f)==3 && hdr[0]==0x51544831u &&
                hdr[1]==(uint32_t)nl && hdr[2]==(uint32_t)ne){
-                G.heat0=malloc((size_t)nl*ne*4);
-                if(G.heat0 && fread(G.heat0,4,(size_t)nl*ne,f)==(size_t)nl*ne){
+                VTG.heat0=malloc((size_t)nl*ne*4);
+                if(VTG.heat0 && fread(VTG.heat0,4,(size_t)nl*ne,f)==(size_t)nl*ne){
                     for(size_t i=0;i<(size_t)nl*ne;i++)
-                        G.slot[i].heat=tier_decay_value(G.heat0[i]);
+                        VTG.slot[i].heat=tier_decay_value(VTG.heat0[i]);
                     fprintf(stderr,"[q38tier] HEAT_FILE loaded: %s\n",hf);
-                } else { free(G.heat0); G.heat0=NULL; }
+                } else { free(VTG.heat0); VTG.heat0=NULL; }
             }
             fclose(f);
         }
     }
-    pthread_mutex_init(&G.mx,NULL);
-    pthread_cond_init(&G.cv,NULL);
-    pthread_cond_init(&G.cv_take,NULL);
+    pthread_mutex_init(&VTG.mx,NULL);
+    pthread_cond_init(&VTG.cv,NULL);
+    pthread_cond_init(&VTG.cv_take,NULL);
     q38t_aff_get(&aff); q38t_aff_widen(&aff);   /* the uploader inherits this mask */
-    if(pthread_create(&G.th,NULL,uploader,NULL)!=0){
-        free(G.slot); free(G.is_x);
-        for(int i=0;i<G.ndev;i++){
-            if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
-            free(G.slot_free[i]);
-            G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+    if(pthread_create(&VTG.th,NULL,uploader,NULL)!=0){
+        free(VTG.slot); free(VTG.is_x);
+        for(int i=0;i<VTG.ndev;i++){
+            if(VTG.arena[i]) coli_cuda_pipe_free(VTG.dev[i],VTG.arena[i]);
+            free(VTG.slot_free[i]);
+            VTG.arena[i]=NULL; VTG.slot_free[i]=NULL; VTG.slot_free_n[i]=0;
         }
         return 0;
     }
     q38t_aff_restore(&aff);
-    G.on=1;
+    VTG.on=1;
     fprintf(stderr,"[q38tier] CUDA VRAM expert tier active: %d device(s), "
                    "fmt=%d%s, %.2f MB/expert, %d experts total\n",
-            G.ndev, G.fmt, G.fmt==4?" (int4 grouped)":" (fp8 e4m3)",
-            G.exp_bytes/1048576.0, nl*ne);
+            VTG.ndev, VTG.fmt, VTG.fmt==4?" (int4 grouped)":" (fp8 e4m3)",
+            VTG.exp_bytes/1048576.0, nl*ne);
     return 1;
 }
 
-int q38t_ready(void){ return G.on; }
+int q38t_ready(void){ return VTG.on; }
 
 int q38t_is_resident(int layer,int eid){
-    if(!G.on||layer<0||layer>=G.nl||eid<0||eid>=G.ne) return 0;
-    pthread_mutex_lock(&G.mx);
+    if(!VTG.on||layer<0||layer>=VTG.nl||eid<0||eid>=VTG.ne) return 0;
+    pthread_mutex_lock(&VTG.mx);
     int r=qs(layer,eid)->resident;
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
     return r;
 }
 
 /* --- heat ---------------------------------------------------------------- */
 
 void q38t_note(int layer,const int *eids,int K){
-    if(!G.on||!eids||layer<0||layer>=G.nl) return;
-    pthread_mutex_lock(&G.mx);
+    if(!VTG.on||!eids||layer<0||layer>=VTG.nl) return;
+    pthread_mutex_lock(&VTG.mx);
     if(layer==0){
-        G.tick++;
+        VTG.tick++;
         /* Periodic decay: an old load must not own the VRAM forever. The
          * promotions, unlike qwen36_tier, are not decided here -- the bytes
          * are needed, and there are none here. */
-        if(!(G.tick%1024)){
-            size_t n=(size_t)G.nl*G.ne;
-            for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+        if(!(VTG.tick%1024)){
+            size_t n=(size_t)VTG.nl*VTG.ne;
+            for(size_t i=0;i<n;i++) VTG.slot[i].heat=tier_decay_value(VTG.slot[i].heat);
         }
     }
     for(int k=0;k<K;k++){
         int e=eids[k];
-        if(e<0||e>=G.ne) continue;
+        if(e<0||e>=VTG.ne) continue;
         Q38TSlot *s=qs(layer,e);
         if(s->heat<0xFFFFFFFFu) s->heat++;
     }
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
 }
 
 /* --- offer and promotion -------------------------------------------------- */
 
 /* Called with the lock held. Returns 1 if queued. */
-static int enqueue_locked(int layer,int eid,int v_layer,int v_eid,
+static int vt_enqueue_locked(int layer,int eid,int v_layer,int v_eid,
                           const uint8_t *gate,const uint8_t *up,
                           const uint8_t *down,const float *scales){
-    if(G.qn>=Q38T_QCAP){ G.q_full_skips++; return 0; }
-    uint8_t *w=malloc(3*G.mat_bytes);
-    float *sc=malloc(3*G.sc*sizeof(float));
-    if(!w||!sc){ free(w); free(sc); G.q_full_skips++; return 0; }
-    stage(w,sc,gate,up,down,scales);
-    G.q[G.qt_].layer=layer; G.q[G.qt_].eid=eid;
-    G.q[G.qt_].w=w;         G.q[G.qt_].s=sc;
-    G.q[G.qt_].v_layer=v_layer; G.q[G.qt_].v_eid=v_eid;
-    G.qt_=(G.qt_+1)%Q38T_QCAP; G.qn++; G.inflight++;
+    if(VTG.qn>=Q38T_QCAP){ VTG.q_full_skips++; return 0; }
+    uint8_t *w=malloc(3*VTG.mat_bytes);
+    float *sc=malloc(3*VTG.sc*sizeof(float));
+    if(!w||!sc){ free(w); free(sc); VTG.q_full_skips++; return 0; }
+    vt_stage(w,sc,gate,up,down,scales);
+    VTG.q[VTG.qt_].layer=layer; VTG.q[VTG.qt_].eid=eid;
+    VTG.q[VTG.qt_].w=w;         VTG.q[VTG.qt_].s=sc;
+    VTG.q[VTG.qt_].v_layer=v_layer; VTG.q[VTG.qt_].v_eid=v_eid;
+    VTG.qt_=(VTG.qt_+1)%Q38T_QCAP; VTG.qn++; VTG.inflight++;
     qs(layer,eid)->queued=1;
-    pthread_cond_signal(&G.cv);
+    pthread_cond_signal(&VTG.cv);
     return 1;
 }
 
 void q38t_offer(int layer,int eid,
                 const uint8_t *gate,const uint8_t *up,const uint8_t *down,
                 const float *scales,int planned){
-    if(!G.on||!gate||!up||!down||!scales) return;
-    if(layer<0||layer>=G.nl||eid<0||eid>=G.ne) return;
+    if(!VTG.on||!gate||!up||!down||!scales) return;
+    if(layer<0||layer>=VTG.nl||eid<0||eid>=VTG.ne) return;
     long rel=-1;                              /* demoted victim awaiting relock */
-    pthread_mutex_lock(&G.mx);
-    G.offers++;
+    pthread_mutex_lock(&VTG.mx);
+    VTG.offers++;
     Q38TSlot *s=qs(layer,eid);
-    if(s->resident||s->queued){ pthread_mutex_unlock(&G.mx); goto out; }
+    if(s->resident||s->queued){ pthread_mutex_unlock(&VTG.mx); goto out; }
 
-    int di=home(eid);
+    int di=vt_home(eid);
     if(planned){
         /* The budget was already reserved by q38t_plan_fill: queue and done.
          * If the plan has meanwhile been cancelled (planned=0), it falls
@@ -638,38 +638,38 @@ void q38t_offer(int layer,int eid,
               * exists for that -- so blocking takes nothing from anyone. In
               * the hot path instead, giving up stays right: there is a token
               * waiting there. */
-            while(G.qn>=Q38T_QCAP && !G.th_stop)
-                pthread_cond_wait(&G.cv_take,&G.mx);
+            while(VTG.qn>=Q38T_QCAP && !VTG.th_stop)
+                pthread_cond_wait(&VTG.cv_take,&VTG.mx);
              /* The wait released the lock: the slot may have changed. */
             if(s->resident||s->queued||!s->planned){
                 if(s->planned){
-                    if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+                    if(VTG.used[di]>=VTG.exp_bytes) VTG.used[di]-=VTG.exp_bytes;
                     arena_give(di,s->arena_idx);
                     s->planned=0;
                 }
-                pthread_mutex_unlock(&G.mx); goto out;
+                pthread_mutex_unlock(&VTG.mx); goto out;
             }
-            if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
-            else { if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+            if(vt_enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) VTG.promotions++;
+            else { if(VTG.used[di]>=VTG.exp_bytes) VTG.used[di]-=VTG.exp_bytes;
                    arena_give(di,s->arena_idx); s->planned=0; }
-            pthread_mutex_unlock(&G.mx); goto out;
+            pthread_mutex_unlock(&VTG.mx); goto out;
         }
     }
 
-    if(G.used[di]+G.exp_bytes<=G.budget[di]){
+    if(VTG.used[di]+VTG.exp_bytes<=VTG.budget[di]){
         uint32_t idx=arena_take(di);
         if(idx!=UINT32_MAX){
-            G.used[di]+=G.exp_bytes;
+            VTG.used[di]+=VTG.exp_bytes;
             s->arena_idx=idx;
-            if(enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) G.promotions++;
-            else { G.used[di]-=G.exp_bytes; arena_give(di,idx); }
+            if(vt_enqueue_locked(layer,eid,-1,-1,gate,up,down,scales)) VTG.promotions++;
+            else { VTG.used[di]-=VTG.exp_bytes; arena_give(di,idx); }
         } else {
             /* Unreachable while the budget invariant holds; never silent. */
             fprintf(stderr,"[q38tier] dev %d: arena exhausted with used %.2f/%.2f GB"
                            " -- offer dropped\n",
-                    G.dev[di], G.used[di]/1073741824.0, G.budget[di]/1073741824.0);
+                    VTG.dev[di], VTG.used[di]/1073741824.0, VTG.budget[di]/1073741824.0);
         }
-        pthread_mutex_unlock(&G.mx); goto out;
+        pthread_mutex_unlock(&VTG.mx); goto out;
     }
 
     /* Card full: entry is only by bumping the coldest resident of this same
@@ -678,20 +678,20 @@ void q38t_offer(int layer,int eid,
      * expert and a token of over a second it is noise, and keeping an ordered
      * structure would cost more complexity than it would save. */
     {
-        size_t n=(size_t)G.nl*G.ne;
+        size_t n=(size_t)VTG.nl*VTG.ne;
         long cold=-1; uint32_t ch=0;
         for(size_t i=0;i<n;i++){
-            Q38TSlot *c=&G.slot[i];
+            Q38TSlot *c=&VTG.slot[i];
             if(!c->resident||c->queued) continue;
-            if(home((int)(i%G.ne))!=di) continue;
+            if(vt_home((int)(i%VTG.ne))!=di) continue;
             if(cold<0||c->heat<ch){ cold=(long)i; ch=c->heat; }
         }
         if(cold>=0 && tier_should_promote(s->heat,ch)){
-            Q38TSlot *v=&G.slot[cold];
+            Q38TSlot *v=&VTG.slot[cold];
             v->resident=0;                       /* from now on it is CPU fallback */
-            if(enqueue_locked(layer,eid,(int)(cold/G.ne),(int)(cold%G.ne),
+            if(vt_enqueue_locked(layer,eid,(int)(cold/VTG.ne),(int)(cold%VTG.ne),
                               gate,up,down,scales)){
-                G.swaps++;
+                VTG.swaps++;
                 s->arena_idx=v->arena_idx;       /* the replacement inherits the
                                                     victim's slot; the uploader
                                                     frees the victim's tensors
@@ -702,103 +702,103 @@ void q38t_offer(int layer,int eid,
         }
     }
 
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
 out:
     /* The victim just lost its VRAM slot: its host ranges must go back to
      * pinned, or a long session would slowly migrate the pinned set onto
      * whatever the hot swaps promote. Outside the mutex (I/O, see above). */
-    if(rel>=0 && g_pin_lock) g_pin_lock((int)(rel/G.ne),(int)(rel%G.ne));
+    if(rel>=0 && g_pin_lock) g_pin_lock((int)(rel/VTG.ne),(int)(rel%VTG.ne));
     return;
 }
 /* --- execution ------------------------------------------------------------ */
 
 uint32_t q38t_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||!eids||!x||K<1||K>32||layer<0||layer>=G.nl) return 0;
+    if(!VTG.on||!eids||!x||K<1||K>32||layer<0||layer>=VTG.nl) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[Q38T_MAX_DEV][Q38T_MAX_ROWS];
     ColiCudaTensor *tu[Q38T_MAX_DEV][Q38T_MAX_ROWS];
     ColiCudaTensor *td[Q38T_MAX_DEV][Q38T_MAX_ROWS];
     static const int rows[Q38T_MAX_ROWS]={1,1,1,1,1,1,1,1};
-    for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
+    for(int i=0;i<VTG.ndev;i++) VTG.is_cnt[i]=0;
 
-    pthread_mutex_lock(&G.mx);
-    G.issue_open=1;
+    pthread_mutex_lock(&VTG.mx);
+    VTG.issue_open=1;
     for(int k=0;k<K;k++){
         int e=eids[k];
-        if(e<0||e>=G.ne){ G.miss++; continue; }
+        if(e<0||e>=VTG.ne){ VTG.miss++; continue; }
         Q38TSlot *s=qs(layer,e);
-        if(!s->resident){ G.miss++; continue; }
-        int di=home(e), c=G.is_cnt[di];
+        if(!s->resident){ VTG.miss++; continue; }
+        int di=vt_home(e), c=VTG.is_cnt[di];
         /* The backend keeps a single issue in flight per device and refuses
          * more than Q38T_MAX_ROWS rows, so a card that sees more experts
          * arrive than the ceiling cannot split the issue: the extras stay on
          * the CPU via the mask. With topk=10 and two cards the eid%2 split
          * sends ~5 each way and the case does not present itself, but nothing
          * forbids it and the count tells (overflow_rows). */
-        if(c>=Q38T_MAX_ROWS){ G.miss++; G.overflow_rows++; continue; }
+        if(c>=Q38T_MAX_ROWS){ VTG.miss++; VTG.overflow_rows++; continue; }
         tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
-        G.is_k[di][c]=k; G.is_cnt[di]=c+1;
-        mask|=1u<<k; G.hits[di]++;
+        VTG.is_k[di][c]=k; VTG.is_cnt[di]=c+1;
+        mask|=1u<<k; VTG.hits[di]++;
     }
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
 
-    for(int di=0;di<G.ndev;di++){
-        int c=G.is_cnt[di];
+    for(int di=0;di<VTG.ndev;di++){
+        int c=VTG.is_cnt[di];
         if(!c) continue;
-        float *xr=G.is_x + (size_t)di*Q38T_MAX_ROWS*G.D;
-        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*G.D, x, (size_t)G.D*sizeof(float));
+        float *xr=VTG.is_x + (size_t)di*Q38T_MAX_ROWS*VTG.D;
+        for(int j=0;j<c;j++) memcpy(xr+(size_t)j*VTG.D, x, (size_t)VTG.D*sizeof(float));
         uint64_t t0=now_ns();
         int ok=coli_cuda_expert_group_issue(tg[di],tu[di],td[di],rows,c,xr);
-        G.t_issue[di]+=now_ns()-t0; G.n_issue[di]++;
+        VTG.t_issue[di]+=now_ns()-t0; VTG.n_issue[di]++;
         if(!ok){
-            for(int j=0;j<c;j++) mask &= ~(1u<<G.is_k[di][j]);
-            G.is_cnt[di]=0;
+            for(int j=0;j<c;j++) mask &= ~(1u<<VTG.is_k[di][j]);
+            VTG.is_cnt[di]=0;
         }
     }
     if(!mask){
-        pthread_mutex_lock(&G.mx);
-        G.issue_open=0;
-        pthread_cond_broadcast(&G.cv_take);
-        pthread_mutex_unlock(&G.mx);
+        pthread_mutex_lock(&VTG.mx);
+        VTG.issue_open=0;
+        pthread_cond_broadcast(&VTG.cv_take);
+        pthread_mutex_unlock(&VTG.mx);
     }
     return mask;
 }
 
 void q38t_take(uint32_t mask,const float *val,int K,float *out){
     (void)K;
-    if(!G.on) return;
-    if(mask&&val&&out) for(int di=0;di<G.ndev;di++){
-        int c=G.is_cnt[di];
+    if(!VTG.on) return;
+    if(mask&&val&&out) for(int di=0;di<VTG.ndev;di++){
+        int c=VTG.is_cnt[di];
         if(!c) continue;
         uint64_t t0=now_ns();
-        const float *y=coli_cuda_expert_group_take(G.dev[di]);
-        G.t_take[di]+=now_ns()-t0; G.n_take[di]++;
+        const float *y=coli_cuda_expert_group_take(VTG.dev[di]);
+        VTG.t_take[di]+=now_ns()-t0; VTG.n_take[di]++;
         if(!y){
             /* These k were in the mask: the CPU skipped them and now nobody
              * computes them, i.e. the token comes out with a piece of the MoE
              * missing. It is not recoverable here (the weights in RAM have
              * already been evicted), but it must not pass silently. */
-            G.take_fails++;
-            if(G.take_fails==1)
+            VTG.take_fails++;
+            if(VTG.take_fails==1)
                 fprintf(stderr,"[q38tier] WARNING: expert_group_take failed on dev %d; "
                                "%d routed expert(s) dropped from this token\n",
-                        G.dev[di], c);
-            G.is_cnt[di]=0;
+                        VTG.dev[di], c);
+            VTG.is_cnt[di]=0;
             continue;
         }
         uint64_t t1=now_ns();
         for(int j=0;j<c;j++){
-            float w=val[G.is_k[di][j]];
-            const float *row=y+(size_t)j*G.D;
-            for(int d=0;d<G.D;d++) out[d]+=w*row[d];
+            float w=val[VTG.is_k[di][j]];
+            const float *row=y+(size_t)j*VTG.D;
+            for(int d=0;d<VTG.D;d++) out[d]+=w*row[d];
         }
-        G.t_acc+=now_ns()-t1;
-        G.is_cnt[di]=0;
+        VTG.t_acc+=now_ns()-t1;
+        VTG.is_cnt[di]=0;
     }
-    pthread_mutex_lock(&G.mx);
-    G.issue_open=0;
-    pthread_cond_broadcast(&G.cv_take);
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
+    VTG.issue_open=0;
+    pthread_cond_broadcast(&VTG.cv_take);
+    pthread_mutex_unlock(&VTG.mx);
 }
 
 /* --- prefill: synchronous grouped compute on the resident experts --------- */
@@ -810,13 +810,13 @@ void q38t_take(uint32_t mask,const float *val,int K,float *out){
  * run: a prefill calls this 48 times per chunk and the steady size is reached
  * on the first layer. */
 static int pf_reserve(size_t floats){
-    if(floats<=G.pf_floats) return 1;
-    float *nx=(float*)realloc(G.pf_x,floats*sizeof(float));
+    if(floats<=VTG.pf_floats) return 1;
+    float *nx=(float*)realloc(VTG.pf_x,floats*sizeof(float));
     if(!nx) return 0;
-    G.pf_x=nx;
-    float *ny=(float*)realloc(G.pf_y,floats*sizeof(float));
+    VTG.pf_x=nx;
+    float *ny=(float*)realloc(VTG.pf_y,floats*sizeof(float));
     if(!ny) return 0;                       /* pf_x kept: it is valid and larger */
-    G.pf_y=ny; G.pf_floats=floats;
+    VTG.pf_y=ny; VTG.pf_floats=floats;
     return 1;
 }
 
@@ -828,7 +828,7 @@ static int pf_flush(int layer,const int *eids,const int *rows,const int *off,
                     int *bi,int n,int brows,
                     const float *x,float *y,uint8_t *done){
     if(n<1||brows<1) return 0;
-    if(!pf_reserve((size_t)brows*G.D)){ G.pf_refused++; return 0; }
+    if(!pf_reserve((size_t)brows*VTG.D)){ VTG.pf_refused++; return 0; }
 
     ColiCudaTensor *tg[64],*tu[64],*td[64];
     int r[64];
@@ -836,50 +836,50 @@ static int pf_flush(int layer,const int *eids,const int *rows,const int *off,
      * letting it go: from here until the flag drops the uploader cannot free
      * a victim (uploader(), "swap: the victim is freed only when no group is
      * in flight"). Same protocol as issue/take, synchronous instead of split. */
-    pthread_mutex_lock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
     int c=0;
     for(int j=0;j<n;j++){
         Q38TSlot *s=qs(layer,eids[bi[j]]);
-        if(!s->resident||!s->tg||!s->tu||!s->td){ G.pf_absent++; continue; }
+        if(!s->resident||!s->tg||!s->tu||!s->td){ VTG.pf_absent++; continue; }
         tg[c]=s->tg; tu[c]=s->tu; td[c]=s->td; r[c]=rows[bi[j]];
         /* bi[] is reused below to scatter, so compact it the same way */
         bi[c]=bi[j];
         c++;
     }
-    if(c) G.issue_open=1;
-    pthread_mutex_unlock(&G.mx);
+    if(c) VTG.issue_open=1;
+    pthread_mutex_unlock(&VTG.mx);
     if(!c) return 0;
 
     int64_t gathered=0;
     for(int j=0;j<c;j++){
-        memcpy(G.pf_x+gathered*G.D, x+(int64_t)off[bi[j]]*G.D,
-               (size_t)r[j]*G.D*sizeof(float));
+        memcpy(VTG.pf_x+gathered*VTG.D, x+(int64_t)off[bi[j]]*VTG.D,
+               (size_t)r[j]*VTG.D*sizeof(float));
         gathered+=r[j];
     }
     uint64_t t0=now_ns();
-    int ok=coli_cuda_expert_group(tg,tu,td,r,c,G.pf_y,G.pf_x);
-    G.t_pf+=now_ns()-t0;
+    int ok=coli_cuda_expert_group(tg,tu,td,r,c,VTG.pf_y,VTG.pf_x);
+    VTG.t_pf+=now_ns()-t0;
 
-    pthread_mutex_lock(&G.mx);
-    G.issue_open=0;
-    pthread_cond_broadcast(&G.cv_take);
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&VTG.mx);
+    VTG.issue_open=0;
+    pthread_cond_broadcast(&VTG.cv_take);
+    pthread_mutex_unlock(&VTG.mx);
 
-    if(!ok){ G.pf_refused++; return 0; }
+    if(!ok){ VTG.pf_refused++; return 0; }
     int64_t scattered=0;
     for(int j=0;j<c;j++){
-        memcpy(y+(int64_t)off[bi[j]]*G.D, G.pf_y+scattered*G.D,
-               (size_t)r[j]*G.D*sizeof(float));
+        memcpy(y+(int64_t)off[bi[j]]*VTG.D, VTG.pf_y+scattered*VTG.D,
+               (size_t)r[j]*VTG.D*sizeof(float));
         scattered+=r[j];
         done[bi[j]]=1;
     }
-    G.pf_batches++; G.pf_experts+=(uint64_t)c; G.pf_rows+=(uint64_t)gathered;
+    VTG.pf_batches++; VTG.pf_experts+=(uint64_t)c; VTG.pf_rows+=(uint64_t)gathered;
     return c;
 }
 
 int q38t_expert_group(int layer,const int *eids,const int *rows,const int *off,
                       int count,const float *x,float *y,uint8_t *done){
-    if(!G.on||!eids||!rows||!off||!x||!y||!done||count<1||layer<0||layer>=G.nl)
+    if(!VTG.on||!eids||!rows||!off||!x||!y||!done||count<1||layer<0||layer>=VTG.nl)
         return 0;
     int *bi=(int*)malloc((size_t)count*sizeof(*bi));
     if(!bi) return 0;
@@ -894,12 +894,12 @@ int q38t_expert_group(int layer,const int *eids,const int *rows,const int *off,
     if(env&&*env){ int v=atoi(env); if(v>0) budget=v; }
 
     int taken=0;
-    G.pf_calls++;
-    for(int di=0;di<G.ndev;di++){
+    VTG.pf_calls++;
+    for(int di=0;di<VTG.ndev;di++){
         int n=0,brows=0;
         for(int c=0;c<count;c++){
             if(rows[c]<1||done[c]) continue;
-            if(eids[c]<0||eids[c]>=G.ne||home(eids[c])!=di) continue;
+            if(eids[c]<0||eids[c]>=VTG.ne||vt_home(eids[c])!=di) continue;
             if(!qs(layer,eids[c])->resident) continue;   /* rechecked under lock */
             /* 64 experts is the backend's own ceiling (GroupDesc host[64],
              * backend_cuda.cu:1850); the row budget is ours. An expert whose
@@ -919,118 +919,118 @@ int q38t_expert_group(int layer,const int *eids,const int *rows,const int *off,
 /* --- warmstart ------------------------------------------------------------ */
 
 static const uint32_t *g_sort_heat;
-static int cmp_heat_desc(const void *a,const void *b){
+static int vt_cmp_heat_desc(const void *a,const void *b){
     uint32_t ha=g_sort_heat[*(const int*)a], hb=g_sort_heat[*(const int*)b];
     return ha<hb ? 1 : (ha>hb ? -1 : 0);
 }
 
 int q38t_plan_fill(int *layers,int *eids,int max){
-    if(!G.on||!layers||!eids||max<1) return 0;
+    if(!VTG.on||!layers||!eids||max<1) return 0;
     if(getenv("Q38T_NO_WARMSTART")) return 0;
-    size_t n=(size_t)G.nl*G.ne;
-    pthread_mutex_lock(&G.mx);
-    if(!G.fill_order){
+    size_t n=(size_t)VTG.nl*VTG.ne;
+    pthread_mutex_lock(&VTG.mx);
+    if(!VTG.fill_order){
         /* Without HEAT_FILE there is no sensible order to invent: let the
          * traffic promote, which is already the normal way. */
-        if(!G.heat0){ pthread_mutex_unlock(&G.mx); return 0; }
-        G.fill_order=malloc(n*sizeof(int));
-        if(!G.fill_order){ pthread_mutex_unlock(&G.mx); return 0; }
-        for(size_t i=0;i<n;i++) G.fill_order[i]=(int)i;
-        g_sort_heat=G.heat0;
-        qsort(G.fill_order,n,sizeof(int),cmp_heat_desc);
-        G.fill_n=(int)n; G.fill_cur=0;
+        if(!VTG.heat0){ pthread_mutex_unlock(&VTG.mx); return 0; }
+        VTG.fill_order=malloc(n*sizeof(int));
+        if(!VTG.fill_order){ pthread_mutex_unlock(&VTG.mx); return 0; }
+        for(size_t i=0;i<n;i++) VTG.fill_order[i]=(int)i;
+        g_sort_heat=VTG.heat0;
+        qsort(VTG.fill_order,n,sizeof(int),vt_cmp_heat_desc);
+        VTG.fill_n=(int)n; VTG.fill_cur=0;
     }
     int out=0;
-    while(out<max && G.fill_cur<G.fill_n){
-        int i=G.fill_order[G.fill_cur++];
-        int layer=i/G.ne, eid=i%G.ne, di=home(eid);
-        Q38TSlot *s=&G.slot[i];
+    while(out<max && VTG.fill_cur<VTG.fill_n){
+        int i=VTG.fill_order[VTG.fill_cur++];
+        int layer=i/VTG.ne, eid=i%VTG.ne, di=vt_home(eid);
+        Q38TSlot *s=&VTG.slot[i];
         if(s->resident||s->queued||s->planned) continue;
-        if(G.used[di]+G.exp_bytes>G.budget[di]) continue;
+        if(VTG.used[di]+VTG.exp_bytes>VTG.budget[di]) continue;
         uint32_t idx=arena_take(di);
         if(idx==UINT32_MAX) continue;         /* budget invariant broken: skip */
-        G.used[di]+=G.exp_bytes;
+        VTG.used[di]+=VTG.exp_bytes;
         s->arena_idx=idx;
         s->planned=1;
         layers[out]=layer; eids[out]=eid; out++;
     }
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
     return out;
 }
 
 void q38t_cancel_plan(int layer,int eid){
-    if(!G.on||layer<0||layer>=G.nl||eid<0||eid>=G.ne) return;
-    pthread_mutex_lock(&G.mx);
+    if(!VTG.on||layer<0||layer>=VTG.nl||eid<0||eid>=VTG.ne) return;
+    pthread_mutex_lock(&VTG.mx);
     Q38TSlot *s=qs(layer,eid);
     if(s->planned&&!s->queued&&!s->resident){
-        int di=home(eid);
-        if(G.used[di]>=G.exp_bytes) G.used[di]-=G.exp_bytes;
+        int di=vt_home(eid);
+        if(VTG.used[di]>=VTG.exp_bytes) VTG.used[di]-=VTG.exp_bytes;
         arena_give(di,s->arena_idx);
         s->planned=0;
-        G.plan_cancels++;
+        VTG.plan_cancels++;
     }
-    pthread_mutex_unlock(&G.mx);
+    pthread_mutex_unlock(&VTG.mx);
 }
 
 void q38t_fill_wait(void){
-    if(!G.on) return;
-    pthread_mutex_lock(&G.mx);
-    while(G.inflight>0 && !G.th_stop) pthread_cond_wait(&G.cv_take,&G.mx);
-    pthread_mutex_unlock(&G.mx);
+    if(!VTG.on) return;
+    pthread_mutex_lock(&VTG.mx);
+    while(VTG.inflight>0 && !VTG.th_stop) pthread_cond_wait(&VTG.cv_take,&VTG.mx);
+    pthread_mutex_unlock(&VTG.mx);
 }
 
 /* --- shutdown and telemetry ----------------------------------------------- */
 
 void q38t_stats(void){
-    if(!G.on) return;
-    pthread_mutex_lock(&G.mx);
-    size_t n=(size_t)G.nl*G.ne;
+    if(!VTG.on) return;
+    pthread_mutex_lock(&VTG.mx);
+    size_t n=(size_t)VTG.nl*VTG.ne;
     uint64_t res=0, hit=0;
-    for(size_t i=0;i<n;i++) if(G.slot[i].resident) res++;
+    for(size_t i=0;i<n;i++) if(VTG.slot[i].resident) res++;
     fprintf(stderr,"[q38tier] resident %llu/%zu experts (%.1f%%)",
             (unsigned long long)res, n, n? 100.0*res/(double)n : 0.0);
-    for(int i=0;i<G.ndev;i++){
-        hit+=G.hits[i];
+    for(int i=0;i<VTG.ndev;i++){
+        hit+=VTG.hits[i];
         fprintf(stderr," | dev%d hits %llu, %.1f/%.1f GB",
-                G.dev[i],(unsigned long long)G.hits[i],
-                G.used[i]/1073741824.0, G.budget[i]/1073741824.0);
+                VTG.dev[i],(unsigned long long)VTG.hits[i],
+                VTG.used[i]/1073741824.0, VTG.budget[i]/1073741824.0);
     }
     fprintf(stderr,"\n[q38tier] gpu %llu, cpu %llu (%.1f%% on GPU) | offers %llu,"
                    " promotions %llu, swaps %llu, uploads %llu, failed %llu,"
                    " queue-full %llu, row-overflow %llu, take-fail %llu,"
                    " plan-cancels %llu\n",
-            (unsigned long long)hit,(unsigned long long)G.miss,
-            (hit+G.miss)? 100.0*hit/(double)(hit+G.miss) : 0.0,
-            (unsigned long long)G.offers,(unsigned long long)G.promotions,
-            (unsigned long long)G.swaps,(unsigned long long)G.uploads,
-            (unsigned long long)G.upload_fail,
-            (unsigned long long)G.q_full_skips,
-            (unsigned long long)G.overflow_rows,
-            (unsigned long long)G.take_fails,
-            (unsigned long long)G.plan_cancels);
-    /* Vedi il commento sui cronometri nella struttura G per come si leggono,
+            (unsigned long long)hit,(unsigned long long)VTG.miss,
+            (hit+VTG.miss)? 100.0*hit/(double)(hit+VTG.miss) : 0.0,
+            (unsigned long long)VTG.offers,(unsigned long long)VTG.promotions,
+            (unsigned long long)VTG.swaps,(unsigned long long)VTG.uploads,
+            (unsigned long long)VTG.upload_fail,
+            (unsigned long long)VTG.q_full_skips,
+            (unsigned long long)VTG.overflow_rows,
+            (unsigned long long)VTG.take_fails,
+            (unsigned long long)VTG.plan_cancels);
+    /* Vedi il commento sui cronometri nella struttura VTG per come si leggono,
      * e in particolare perche' t_take di dev1 e' un eccesso e non un assoluto. */
     uint64_t t_is=0,t_tk=0;
-    for(int i=0;i<G.ndev;i++){ t_is+=G.t_issue[i]; t_tk+=G.t_take[i]; }
+    for(int i=0;i<VTG.ndev;i++){ t_is+=VTG.t_issue[i]; t_tk+=VTG.t_take[i]; }
     fprintf(stderr,"[q38tier] hot path: issue %.3f s, take %.3f s, accumulate %.3f s"
                    " (total %.3f s)\n",
-            t_is/1e9, t_tk/1e9, G.t_acc/1e9, (t_is+t_tk+G.t_acc)/1e9);
-    for(int i=0;i<G.ndev;i++)
+            t_is/1e9, t_tk/1e9, VTG.t_acc/1e9, (t_is+t_tk+VTG.t_acc)/1e9);
+    for(int i=0;i<VTG.ndev;i++)
         fprintf(stderr,"[q38tier]   dev%d: %llu issues %.3f s (%.1f us/call) |"
                        " %llu takes %.3f s (%.1f us/call)\n",
-                G.dev[i],
-                (unsigned long long)G.n_issue[i], G.t_issue[i]/1e9,
-                G.n_issue[i]? G.t_issue[i]/1000.0/G.n_issue[i] : 0.0,
-                (unsigned long long)G.n_take[i], G.t_take[i]/1e9,
-                G.n_take[i]? G.t_take[i]/1000.0/G.n_take[i] : 0.0);
-    if(G.pf_calls)
+                VTG.dev[i],
+                (unsigned long long)VTG.n_issue[i], VTG.t_issue[i]/1e9,
+                VTG.n_issue[i]? VTG.t_issue[i]/1000.0/VTG.n_issue[i] : 0.0,
+                (unsigned long long)VTG.n_take[i], VTG.t_take[i]/1e9,
+                VTG.n_take[i]? VTG.t_take[i]/1000.0/VTG.n_take[i] : 0.0);
+    if(VTG.pf_calls)
         fprintf(stderr,"[q38tier] prefill: %llu calls, %llu batches, %llu experts,"
                        " %llu rows, %.3f s on GPU | refused %llu, absent %llu\n",
-                (unsigned long long)G.pf_calls,(unsigned long long)G.pf_batches,
-                (unsigned long long)G.pf_experts,(unsigned long long)G.pf_rows,
-                G.t_pf/1e9,
-                (unsigned long long)G.pf_refused,(unsigned long long)G.pf_absent);
-    pthread_mutex_unlock(&G.mx);
+                (unsigned long long)VTG.pf_calls,(unsigned long long)VTG.pf_batches,
+                (unsigned long long)VTG.pf_experts,(unsigned long long)VTG.pf_rows,
+                VTG.t_pf/1e9,
+                (unsigned long long)VTG.pf_refused,(unsigned long long)VTG.pf_absent);
+    pthread_mutex_unlock(&VTG.mx);
 }
 
 /* The heat learned in this session, for the next one. Same format as the
@@ -1042,12 +1042,12 @@ static void heat_save(void){
     if(!hf) return;
     FILE *f=fopen(hf,"wb");
     if(!f){ fprintf(stderr,"[q38tier] cannot write HEAT_FILE %s\n",hf); return; }
-    uint32_t hdr[3]={0x51544831u,(uint32_t)G.nl,(uint32_t)G.ne};
-    size_t n=(size_t)G.nl*G.ne;
+    uint32_t hdr[3]={0x51544831u,(uint32_t)VTG.nl,(uint32_t)VTG.ne};
+    size_t n=(size_t)VTG.nl*VTG.ne;
     uint32_t *h=malloc(n*4);
     int ok=0;
     if(h){
-        for(size_t i=0;i<n;i++) h[i]=G.slot[i].heat;
+        for(size_t i=0;i<n;i++) h[i]=VTG.slot[i].heat;
         ok = fwrite(hdr,4,3,f)==3 && fwrite(h,4,n,f)==n;
         free(h);
     }
@@ -1056,34 +1056,34 @@ static void heat_save(void){
 }
 
 void q38t_shutdown(void){
-    if(!G.on) return;
+    if(!VTG.on) return;
     heat_save();
-    pthread_mutex_lock(&G.mx);
-    G.th_stop=1;
-    pthread_cond_broadcast(&G.cv);
-    pthread_cond_broadcast(&G.cv_take);
-    pthread_mutex_unlock(&G.mx);
-    pthread_join(G.th,NULL);
+    pthread_mutex_lock(&VTG.mx);
+    VTG.th_stop=1;
+    pthread_cond_broadcast(&VTG.cv);
+    pthread_cond_broadcast(&VTG.cv_take);
+    pthread_mutex_unlock(&VTG.mx);
+    pthread_join(VTG.th,NULL);
     /* What remains in the queue was never loaded: free the staging. */
-    while(G.qn>0){ free(G.q[G.qh].w); free(G.q[G.qh].s);
-                   G.qh=(G.qh+1)%Q38T_QCAP; G.qn--; }
-    size_t n=(size_t)G.nl*G.ne;
+    while(VTG.qn>0){ free(VTG.q[VTG.qh].w); free(VTG.q[VTG.qh].s);
+                   VTG.qh=(VTG.qh+1)%Q38T_QCAP; VTG.qn--; }
+    size_t n=(size_t)VTG.nl*VTG.ne;
     for(size_t i=0;i<n;i++){
-        Q38TSlot *s=&G.slot[i];
+        Q38TSlot *s=&VTG.slot[i];
         if(s->tg) coli_cuda_tensor_free(s->tg);
         if(s->tu) coli_cuda_tensor_free(s->tu);
         if(s->td) coli_cuda_tensor_free(s->td);
         s->tg=s->tu=s->td=NULL; s->resident=0;
     }
-    free(G.slot); free(G.is_x); free(G.pf_x); free(G.pf_y); G.pf_x=G.pf_y=NULL; G.pf_floats=0; free(G.fill_order); free(G.heat0);
-    G.slot=NULL; G.is_x=NULL; G.fill_order=NULL; G.heat0=NULL;
+    free(VTG.slot); free(VTG.is_x); free(VTG.pf_x); free(VTG.pf_y); VTG.pf_x=VTG.pf_y=NULL; VTG.pf_floats=0; free(VTG.fill_order); free(VTG.heat0);
+    VTG.slot=NULL; VTG.is_x=NULL; VTG.fill_order=NULL; VTG.heat0=NULL;
     /* The tensors own nothing, so the arena dies after them, whole. */
-    for(int i=0;i<G.ndev;i++){
-        if(G.arena[i]) coli_cuda_pipe_free(G.dev[i],G.arena[i]);
-        free(G.slot_free[i]);
-        G.arena[i]=NULL; G.slot_free[i]=NULL; G.slot_free_n[i]=0;
+    for(int i=0;i<VTG.ndev;i++){
+        if(VTG.arena[i]) coli_cuda_pipe_free(VTG.dev[i],VTG.arena[i]);
+        free(VTG.slot_free[i]);
+        VTG.arena[i]=NULL; VTG.slot_free[i]=NULL; VTG.slot_free_n[i]=0;
     }
-    G.on=0;
+    VTG.on=0;
 }
 
 /* ---- dense BF16 matmul on the GPU (Q38_DENSE_GPU=1) ------------------------
@@ -1099,9 +1099,9 @@ void q38t_shutdown(void){
  * the CPU by construction. fmt=9 (backend_cuda.cu) removes that, and this is
  * the engine-side door to it.
  *
- * Deliberately independent of the expert tier's G state: the tier refuses to
+ * Deliberately independent of the expert tier's VTG state: the tier refuses to
  * attach for reasons that say nothing about the dense side (a second model in
- * the process, an expert format it does not stage), and the dense set is worth
+ * the process, an expert format it does not vt_stage), and the dense set is worth
  * VRAM regardless. The only shared resource is the backend's device context,
  * which is why this NEVER calls coli_cuda_init when one already exists --
  * coli_cuda_init resets g_nctx and would orphan every resident expert tensor. */
@@ -1133,7 +1133,11 @@ int q38t_dense_enabled(void){
     if(!DG.checked){
         DG.checked=1;
         const char *e=getenv("Q38_DENSE_GPU");
-        DG.wanted=(e && *e=='1');
+        /* Q38_TIER_TRUNK=1 hands the cards to upstream's tier (fp8 experts,
+         * int8 trunk): our dense port must stay off with it, or the same
+         * matrices get staged twice under two budgets. */
+        const char *t=getenv("Q38_TIER_TRUNK");
+        DG.wanted=(e && *e=='1') && !(t && *t=='1' && !t[1]);
     }
     return DG.wanted;
 }
