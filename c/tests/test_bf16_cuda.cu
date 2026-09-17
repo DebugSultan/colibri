@@ -10,7 +10,7 @@
  * scale buffer".
  *
  * Four claims, each independently falsifiable:
- *   1. DECODE -- weight_at(fmt=9) reproduces st.h's bf16_to_f32 BIT FOR BIT on
+ *   1. DECODE -- bf16_at() reproduces st.h's bf16_to_f32 BIT FOR BIT on
  *      all 65536 bf16 patterns, NaN/inf/subnormals included. Compared as raw
  *      u32 so NaN != NaN cannot hide a mismatch. A shift-by-15, a byte swap or
  *      a float16 decoder all die here.
@@ -48,7 +48,7 @@ static inline uint32_t bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; 
  * weights, one output per pattern. */
 __global__ static void decode_all(const void *w, float *out, int n) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (i < n) out[i] = weight_at(w, 9, 0, i);
+    if (i < n) out[i] = bf16_at(static_cast<const uint8_t *>(w), (size_t)i);
 }
 
 int main(void) {
