@@ -321,14 +321,19 @@ __device__ static inline float mx4_weight_at(const uint8_t *q, int i) {
  * Each of those is sufficient on its own for the sites it covers; this trap
  * exists because none of them is a property of THIS function. Reaching this line
  * means a launch site got past its own gate, which is a bug in that gate. */
+/* bf16 -> f32 is the identity on the top 16 bits: no rounding, no table, no
+ * cuda_bf16.h dependency. Every bf16 value (subnormals, inf, NaN) maps to the
+ * f32 with the same sign/exponent and a zeroed mantissa tail, which is exactly
+ * what the CPU q38_matmul_bf16 reference does and what st.h's bf16_to_f32 is.
+ * The fmt=9 branch of quant_matmul_kernel decodes through this, and so does
+ * tests/test_bf16_cuda.cu claim 1 -- one expression, no copy to drift. */
+__device__ static inline float bf16_at(const uint8_t *base, size_t i) {
+    return __uint_as_float((uint32_t)reinterpret_cast<const uint16_t *>(base)[i] << 16);
+}
+
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
     if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
-    /* bf16 -> f32 is the identity on the top 16 bits: no rounding, no table, no
-     * cuda_bf16.h dependency. Every bf16 value (subnormals, inf, NaN) maps to
-     * the f32 with the same sign/exponent and a zeroed mantissa tail, which is
-     * exactly what the CPU q38_matmul_bf16 reference does. */
-    if (fmt == 9) return __uint_as_float((uint32_t)reinterpret_cast<const uint16_t *>(base)[i] << 16);
     if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
     const uint8_t *q = base;
     if (fmt == 2 || fmt == 4) {                               /* fmt=4: same nibble layout */
@@ -571,6 +576,19 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
+    } else if (fmt == 9) {
+        /* bf16 dense weights (our qwen38 eager path, 46dc695). bf16 -> f32 is
+         * the identity on the top 16 bits: no rounding, no table, no
+         * cuda_bf16.h dependency — every bf16 value maps to the f32 with the
+         * same sign/exponent and a zeroed mantissa tail, exactly what the CPU
+         * q38_matmul_bf16 reference does. Like fmt 6/7/8, this is NOT a quant
+         * family: weight_at refuses it, the host predicates keep it out of the
+         * absorb and grouped kernels, and it decodes here in its own branch.
+         * Scale-free: the epilogue skips the trailing multiply via
+         * fmt_scale_free(9). */
+        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
+        for (int i = threadIdx.x; i < I; i += blockDim.x)
+            sum += xs[i] * bf16_at(wrow, (size_t)i);
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
