@@ -170,7 +170,19 @@ static void arena_give(int di, uint32_t idx){
  * card of the dense reserve it was being given. */
 static size_t dev_reserve_for(int device){
     const char *m=getenv("Q38T_DEV_RESERVE_MB");
-    if(!m || !*m) return Q38T_DEV_RESERVE;
+    if(!m || !*m){
+        /* Hybrid (Q38_TIER_TRUNK=2): the reserve is no longer a courtesy
+         * floor, it is the int8 trunk's claim on the card. Measurement showed
+         * both sides of the knife: the default left the trunk 0.85 GB/card
+         * (32/553 matrices, dense worse than eager), 5 GiB placed 3.65 GiB
+         * int8 and took decode from 3.63 to 5.08 tok/s. The arena stays
+         * greedy over what remains -- that is its job -- but it must not
+         * expand into the dense tier's share just because the eager port is
+         * off. An explicit Q38T_DEV_RESERVE_MB still overrides. */
+        const char *t=getenv("Q38_TIER_TRUNK");
+        if(t && t[0]=='2' && !t[1]) return (size_t)5120*1024*1024;
+        return Q38T_DEV_RESERVE;
+    }
     if(!strchr(m,',')){
         double mb=atof(m);
         return mb>0 ? (size_t)(mb*1024.0*1024.0) : Q38T_DEV_RESERVE;
