@@ -7,14 +7,6 @@ https://github.com/JustVugg/colibri/issues/1306#issuecomment-5736198159
 in-place (id invariato `5736198159`, `user: DebugSultan`, #1306 resta a 6
 commenti: nessun secondo commento e' stato postato).
 
-Nota sul blocco che c'era: il PATCH rispondeva `403 Resource not accessible by
-personal access token` perche' l'account `gh` attivo era il PAT fine-grained,
-senza `Issues: write` sui repo di terzi. Nel `hosts.yml` esiste una seconda voce
-etichettata `laserpollo` che pero' e' **lo stesso account GitHub** (`gh api user`
-risponde `login: DebugSultan`, id 99316470) con un token classico scope `repo`:
-e' quello che porta i permessi di scrittura. Se un gesto verso upstream torna
-403, la prima cosa da provare e' `gh auth switch --user laserpollo`.
-
 Comando usato (il JSON contiene il corpo COMPLETO, vecchio + integrazione):
 `gh api --method PATCH repos/JustVugg/colibri/issues/comments/5736198159 --input pr-fmt9/body-1306.json`
 
