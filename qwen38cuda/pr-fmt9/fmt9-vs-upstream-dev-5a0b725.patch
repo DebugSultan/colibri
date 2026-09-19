@@ -1,0 +1,347 @@
+diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
+--- a/c/backend_cuda.cu
++++ b/c/backend_cuda.cu
+@@ -176,6 +176,15 @@
+ #define COLI_E8_SUB      32
+ #define COLI_E8_BBYTES   98
+ 
++/* Formats with no separate scale buffer: fmt=0 (f32) and fmt=9 (bf16) carry
++ * their magnitude in the weights themselves, fmt=6 keeps its scales inside each
++ * block. None of them has a scale array to allocate, upload, charge against the
++ * device budget or refresh -- the rule lives here so the call sites that used to
++ * spell out `fmt && fmt != 6` cannot drift apart as formats are added. */
++__host__ __device__ static int fmt_scale_free(int fmt) {
++    return fmt == 0 || fmt == 6 || fmt == 9;
++}
++
+ __host__ __device__ static size_t row_bytes(int fmt, int I) {
+     if (fmt == 0) return (size_t)I * sizeof(float);
+     if (fmt == 1) return (size_t)I;
+@@ -185,9 +194,17 @@
+     if (fmt == 7) return (size_t)(I + 1) / 2;   /* MXFP4: e2m1 nibbles, 2 per byte */
+     if (fmt == 6) return (size_t)(((int64_t)I + COLI_E8_QK - 1) / COLI_E8_QK) * COLI_E8_BBYTES;
+     if (fmt == 8) return (size_t)I;             /* fp8-e4m3: raw bytes, layout of fmt=1 */
++    if (fmt == 9) return (size_t)I * 2;         /* bf16: two raw bytes per weight, no scales */
+     return 0;
+ }
+ 
++/* fmt=9 (bf16) decode. bf16 -> f32 is the identity on the top 16 bits: no
++ * rounding, no table, no <cuda_bf16.h> dependency. Mirrors the CPU reference
++ * bf16_to_f32 in st.h bit for bit, NaN and Inf patterns included. */
++__device__ static inline float bf16_at(const uint8_t *base, size_t i) {
++    return __uint_as_float((uint32_t)reinterpret_cast<const uint16_t *>(base)[i] << 16);
++}
++
+ /* The E8 codebook, uploaded once per device from quant.h's e8_grid so the table
+  * has a single source of truth and cannot drift from the CPU decoder. */
+ __constant__ uint8_t c_e8_grid[256][4];
+@@ -331,7 +348,7 @@
+  * attention absorb kernels apply per-group scales instead of the per-row
+  * (fmt=2) semantic that crashed #298's g64 kv_b. */
+ __device__ static float absorb_scale(const float *wscale, int fmt, int gs, int ng, int row, int k) {
+-    if (!fmt) return 1.f;
++    if (fmt_scale_free(fmt)) return 1.f;
+     if (fmt != 4) return wscale[row];
+     int g = k / gs; if (g >= ng) g = ng - 1;   /* tail of the last (partial) group */
+     return wscale[(size_t)row * ng + g];
+@@ -551,6 +568,12 @@
+         const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
+         for (int i = threadIdx.x; i < I; i += blockDim.x)
+             sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
++    } else if (fmt == 9) {
++        /* bf16: the magnitude is in the weight, so there is nothing to apply
++         * before or after the reduce -- see the epilogue's scale-free test. */
++        const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
++        for (int i = threadIdx.x; i < I; i += blockDim.x)
++            sum += xs[i] * bf16_at(wrow, (size_t)i);
+     } else {
+         for (int i = threadIdx.x; i < I; i += blockDim.x)
+             sum += xs[i] * weight_at(weights, fmt, row, i);
+@@ -569,8 +592,10 @@
+          * block header, 8 reads a per-128 block scale alongside the weights.
+          * Only the per-row formats get the trailing multiply --
+          * and for fmt=7 `scales` points at ue8m0 BYTES, so reading it as float
+-         * here does not merely double-scale, it reads garbage. */
+-        y[(size_t)s * O + o] = (fmt && fmt != 4 && fmt != 6 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
++         * here does not merely double-scale, it reads garbage. The scale-free
++         * formats (0, 6, 9) are excluded through the shared predicate: they have
++         * no `scales` array at all, so the multiply would dereference NULL. */
++        y[(size_t)s * O + o] = (!fmt_scale_free(fmt) && fmt != 4 && fmt != 7 && fmt != 8) ? partial[0] * scales[o] : partial[0];
+ }
+ 
+ /* fmt=6 activation rotation, y = Q^T x for Q = D*H/sqrt(n) (#452). One block per
+@@ -1411,7 +1436,7 @@
+     size_t rb = row_bytes(fmt, I);
+     /* fmt=6 keeps its scales inside each 98-byte block, so it is the one
+      * quantized format that legitimately arrives with scales == NULL. */
+-    if (!rb || (fmt && fmt != 6 && !scales)) return 0;
++    if (!rb || (!fmt_scale_free(fmt) && !scales)) return 0;
+     if (fmt == 8 && !g_fp8_lut_ready) return 0;   /* kernels would read a zero LUT */
+     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+     if (!t) return 0;
+@@ -1438,7 +1463,7 @@
+     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
+         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
+-    if (fmt && fmt != 6) {
++    if (!fmt_scale_free(fmt)) {
+         if (!cuda_ok(cudaMalloc(&t->scales, t->scale_count * sizeof(float)), "scale allocation") ||
+             !cuda_ok(cudaMemcpy(t->scales, scales, t->scale_count * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
+             coli_cuda_tensor_free(t);
+@@ -1448,7 +1473,7 @@
+     if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
+     t->tracked = 1;
+     ctx->tensor_count++;
+-    ctx->tensor_bytes += t->weight_bytes + ((fmt && fmt != 6) ? t->scale_count * sizeof(float) : 0);
++    ctx->tensor_bytes += t->weight_bytes + (!fmt_scale_free(fmt) ? t->scale_count * sizeof(float) : 0);
+     *tensor = t;
+     return 1;
+ }
+@@ -1621,7 +1646,7 @@
+ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
+                                           const void *weights,
+                                           const float *scales) {
+-    if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
++    if (!tensor || !weights || (!fmt_scale_free(tensor->fmt) && !scales)) return 0;
+ #ifdef COLI_ANS
+     if(tensor->compressed) return 0;
+ #endif
+@@ -2398,7 +2423,7 @@
+ #endif
+             tensor->weight_bytes;
+         size_t bytes = storage_bytes +
+-            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
++            (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
+         if (ctx->tensor_count) ctx->tensor_count--;
+         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
+     }
+@@ -2422,7 +2447,7 @@
+ #endif
+         tensor->weight_bytes;
+     return storage_bytes +
+-        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
++        (!fmt_scale_free(tensor->fmt) ? tensor->scale_count * sizeof(float) : 0);
+ }
+ 
+ /* What a cudaMalloc of `bytes` actually takes off the card.
+@@ -2535,7 +2560,7 @@
+ #endif
+         tensor->weight_bytes;
+     size_t total = coli_cuda_alloc_footprint(storage_bytes);
+-    if (tensor->fmt && tensor->fmt != 6)
++    if (!fmt_scale_free(tensor->fmt))
+         total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
+     return total;
+ }
+diff -ruN orig/c/backend_cuda.h updev/c/backend_cuda.h
+--- a/c/backend_cuda.h
++++ b/c/backend_cuda.h
+@@ -42,8 +42,10 @@
+  * same arrangement colibri.c uses for metal_fused_fmt_ok.
+  *
+  * NOT a statement about which formats the CUDA BACKEND supports: quant_matmul
+- * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4) and fmt=8
+- * (fp8-e4m3) that never route through weight_at. This predicate is scoped to
++ * has its own explicit branches for fmt=6 (E8/IQ3), fmt=7 (MXFP4), fmt=8
++ * (fp8-e4m3) and fmt=9 (bf16) that never route through weight_at. fmt=9 is
++ * deliberately NOT admitted here: callers ask this predicate "can weight_at
++ * decode it", and bf16 rides coli_cuda_matmul's own branch instead. This predicate is scoped to
+  * weight_at's own dispatch, which is what the absorb and grouped-expert kernels
+  * decode through. */
+ static inline int coli_cuda_weight_at_supported(int fmt) {
+@@ -100,8 +102,13 @@
+ 
+ /*
+  * y[S,O] = x[S,I] @ W[O,I]^T.
+- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4.
++ * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2, 4=grouped int4,
++ * plus 9=bf16, which this backend decodes in a device branch of its own: a
++ * checkpoint whose dense side (attention projections, gated residual, shared
++ * expert, router, lm_head) is bf16 end to end carries no scales at all, and
++ * bf16 -> f32 is the identity on the top 16 bits.
+  * gs is the group size for fmt=4 (0 for all other formats).
++ * Formats 0, 6 and 9 are scale-free: pass scales = NULL for them.
+  * The first successful call uploads W and its scales; later calls reuse it.
+  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
+  */
+diff -ruN orig/c/Makefile updev/c/Makefile
+--- a/c/Makefile
++++ b/c/Makefile
+@@ -944,7 +944,7 @@
+ $(RANSLIB): tools/rans_ctypes.c rans.h
+ 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
+ 
+-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu
++cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu tests/test_alloc_footprint_cuda.cu tests/test_bf16_cuda.cu
+ 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+ 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+ 	./backend_cuda_test$(EXE)
+@@ -957,6 +957,15 @@
+ 	# API by design. Re-execs itself per probe (the trap poisons the context).
+ 	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+ 	./cuda_fmt_trap_test$(EXE)
++	# fmt=9 (bf16): decode sweep over all 65536 bit patterns against st.h's
++	# bf16_to_f32, matmul parity against a double CPU reference, and the
++	# scale-free contract (upload/refresh/byte count with scales == NULL,
++	# plus the negative control that a scaled format still refuses NULL).
++	# Includes backend_cuda.cu itself, so only the test file is compiled.
++	# Runs early: it is the cheapest kernel test in the recipe and has no
++	# host-dependent failure mode.
++	"$(GPUCC)" $(GPUFLAGS) tests/test_bf16_cuda.cu -o bf16_cuda_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
++	./bf16_cuda_test$(EXE)
+ 	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
+ 	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
+ 	# itself (kernel-level oracle), so only the test file is compiled.
+diff -ruN orig/c/tests/test_bf16_cuda.cu updev/c/tests/test_bf16_cuda.cu
+--- /dev/null
++++ b/c/tests/test_bf16_cuda.cu
+@@ -0,0 +1,149 @@
++/* fmt=9 (bf16) — decode, parity and scale-free accounting oracle.
++ *
++ * The qwen38 dense side (attention q/k/v/o, DeltaNet in/out_proj, the gated
++ * residual, the shared expert, the router and lm_head) is bf16 end to end and
++ * carries NO scales, while this backend had no bf16 format at all: every dense
++ * matmul therefore stayed on the CPU, which is 86.9% of the per-token decode
++ * byte traffic. fmt=9 is the enabling brick, and it is additive -- it rides the
++ * generic weight_at branch of quant_matmul, so the only way it can be wrong is
++ * in the decode itself or in the scale bookkeeping that assumed "fmt != 0 has a
++ * scale buffer".
++ *
++ * Four claims, each independently falsifiable:
++ *   1. DECODE -- bf16_at() reproduces st.h's bf16_to_f32 BIT FOR BIT on
++ *      all 65536 bf16 patterns, NaN/inf/subnormals included. Compared as raw
++ *      u32 so NaN != NaN cannot hide a mismatch. A shift-by-15, a byte swap or
++ *      a float16 decoder all die here.
++ *   2. PARITY -- coli_cuda_matmul(fmt=9) against a double CPU reference built
++ *      on bf16_to_f32 itself, over a shape with an odd I (tail) and S>1.
++ *   3. SCALE-FREE -- the tensor must upload with scales == NULL, charge ZERO
++ *      scale bytes (coli_cuda_tensor_bytes == I*O*2), and accept a refresh with
++ *      a NULL scale pointer. This is what the fmt_scale_free() consolidation
++ *      claims; before it, fmt=9 would have cudaMalloc'd O floats, copied from
++ *      NULL, and the trailing `partial[0] * scales[o]` would have dereferenced
++ *      a null pointer on every output.
++ *   4. NEGATIVE CONTROL -- the widened guard must NOT admit a scale-bearing
++ *      format with no scales: fmt=1 + NULL must still be refused. Without this,
++ *      claim 3 would be satisfied just as well by deleting the guard.
++ *
++ * Build: nvcc -O2 -std=c++17 -arch=native tests/test_bf16_cuda.cu -o bf16_cuda_test
++ */
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cmath>
++#include <cstdint>
++#include <cuda_runtime.h>
++
++#include "../backend_cuda.cu"
++
++/* Byte-for-byte st.h's bf16_to_f32 -- the CPU decoder every qwen38 dense path
++ * already uses. Restated here because st.h is C and this TU is C++. */
++static inline float ref_bf16_to_f32(uint16_t h) {
++    uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f;
++}
++static inline uint32_t bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
++
++/* Claim 1 runs weight_at itself, not a copy of it: one row of 65536 bf16
++ * weights, one output per pattern. */
++__global__ static void decode_all(const void *w, float *out, int n) {
++    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
++    if (i < n) out[i] = bf16_at(static_cast<const uint8_t *>(w), (size_t)i);
++}
++
++int main(void) {
++    int bad = 0;
++    if (!coli_cuda_init((int[]){0}, 1)) { printf("FAIL cuda init\n"); return 1; }
++
++    /* ---- claim 1: exhaustive bit-exact decode ---- */
++    {
++        const int N = 65536;
++        uint16_t *hw = (uint16_t *)malloc((size_t)N * 2);
++        for (int i = 0; i < N; i++) hw[i] = (uint16_t)i;
++        void *dw = NULL; float *dy = NULL;
++        float *hy = (float *)malloc((size_t)N * 4);
++        if (cudaMalloc(&dw, (size_t)N * 2) != cudaSuccess ||
++            cudaMalloc(&dy, (size_t)N * 4) != cudaSuccess ||
++            cudaMemcpy(dw, hw, (size_t)N * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
++            printf("FAIL decode setup\n"); return 1; }
++        decode_all<<<(N + 255) / 256, 256>>>(dw, dy, N);
++        if (cudaGetLastError() != cudaSuccess ||
++            cudaMemcpy(hy, dy, (size_t)N * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
++            printf("FAIL decode launch\n"); return 1; }
++        int mism = 0;
++        for (int i = 0; i < N; i++)
++            if (bits(hy[i]) != bits(ref_bf16_to_f32((uint16_t)i))) {
++                if (mism < 5) printf("  decode mismatch pattern 0x%04x: got 0x%08x want 0x%08x\n",
++                                     i, bits(hy[i]), bits(ref_bf16_to_f32((uint16_t)i)));
++                mism++;
++            }
++        if (mism) { printf("FAIL decode: %d/%d patterns\n", mism, N); bad += mism; }
++        else printf("  decode: 65536/65536 bf16 patterns bit-exact\n");
++        cudaFree(dw); cudaFree(dy); free(hw); free(hy);
++    }
++
++    /* ---- claims 2+3: GEMM parity and scale-free residency ---- */
++    srand(9);
++    const int S = 3, I = 257, O = 64;          /* odd I: the row stride is I*2, not padded */
++    uint16_t *w = (uint16_t *)malloc((size_t)I * O * 2);
++    float *x = (float *)malloc((size_t)S * I * 4);
++    float *y = (float *)malloc((size_t)S * O * 4);
++    /* Draw the weights as bf16 patterns of real magnitude rather than random
++     * 16-bit noise, which would be mostly inf/NaN and make the parity check
++     * vacuous. */
++    for (size_t i = 0; i < (size_t)I * O; i++) {
++        float v = (rand() / (float)RAND_MAX - .5f) * 2.f;
++        w[i] = (uint16_t)(bits(v) >> 16);
++    }
++    for (size_t i = 0; i < (size_t)S * I; i++) x[i] = (rand() / (float)RAND_MAX - .5f) * 2.f;
++
++    ColiCudaTensor *t = NULL;
++    if (!coli_cuda_matmul(&t, y, x, w, NULL, 9, S, I, O, 0, 0)) {
++        printf("FAIL matmul fmt=9 (scales==NULL refused?)\n"); return 1; }
++
++    int par = 0;
++    for (int s = 0; s < S; s++)
++        for (int o = 0; o < O; o++) {
++            double a = 0;
++            for (int i = 0; i < I; i++)
++                a += (double)x[(size_t)s * I + i] * (double)ref_bf16_to_f32(w[(size_t)o * I + i]);
++            float got = y[(size_t)s * O + o];
++            /* f32 tree reduction over 257 terms vs a double serial sum: a few
++             * ulp. A double-applied scale or a wrong row stride moves the
++             * output by O(1). */
++            if (fabs(got - a) > 1e-4 * (fabs(a) + 1e-3)) {
++                if (par < 5) printf("  parity mismatch s=%d o=%d: got %g want %g\n", s, o, got, a);
++                par++;
++            }
++        }
++    if (par) { printf("FAIL parity: %d/%d outputs\n", par, S * O); bad += par; }
++    else printf("  parity: %d outputs vs the double CPU reference\n", S * O);
++
++    size_t want_bytes = (size_t)I * O * 2, got_bytes = coli_cuda_tensor_bytes(t);
++    if (got_bytes != want_bytes) {
++        printf("FAIL accounting: tensor_bytes %zu, expected %zu (scale bytes charged?)\n",
++               got_bytes, want_bytes); bad++;
++    } else printf("  accounting: %zu bytes, no scale buffer charged\n", got_bytes);
++
++    if (!coli_cuda_tensor_update(t, w, NULL)) {
++        printf("FAIL refresh: fmt=9 update with NULL scales refused\n"); bad++;
++    } else printf("  refresh: in-place update with NULL scales accepted\n");
++
++    /* ---- claim 4: the guard is not over-widened ---- */
++    {
++        ColiCudaTensor *t8 = NULL;
++        int8_t *q = (int8_t *)calloc((size_t)I * O, 1);
++        if (coli_cuda_tensor_upload(&t8, q, NULL, 1, I, O, 0)) {
++            printf("FAIL negative control: fmt=1 accepted a NULL scale pointer\n");
++            bad++; coli_cuda_tensor_free(t8);
++        } else printf("  negative control: fmt=1 + NULL scales still refused\n");
++        free(q);
++    }
++
++    coli_cuda_tensor_free(t);
++    free(w); free(x); free(y);
++    printf("bf16 (fmt=9) oracle: %d failures\n", bad);
++    if (bad) { printf("FAIL\n"); return 1; }
++    printf("ok\n");
++    return 0;
++}
