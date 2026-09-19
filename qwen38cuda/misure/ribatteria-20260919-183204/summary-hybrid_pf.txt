@@ -1,0 +1,9 @@
+PEAK RSS: 55.93 GB
+[qtier]   dev 0: hits 0 | 16590 tensors, 14.24 GB VRAM used (0.00 GB trunk + experts, budget 0.00 GB)
+[qtier]   dev 1: hits 0 | 16707 tensors, 14.34 GB VRAM used (0.00 GB trunk + experts, budget 0.00 GB)
+[qtier] VRAM hit rate: 0.0 % | LFRU swaps 0
+Expert cache hit rate: 92.1% (hit=262417 miss=22425)
+Speed: 0.22 tok/s (291.4s for 64 tokens)
+[q38tier] resident 11099/24576 experts (45.2%) | dev0 hits 10418, 14.2/14.2 GB | dev1 hits 10777, 14.3/14.3 GB
+[q38tier] gpu 21195, cpu 9045 (70.1% on GPU) | offers 20144, promotions 11099, swaps 784, uploads 11883, failed 0, queue-full 0, row-overflow 18, take-fail 0, plan-cancels 0
+[q38tier] prefill: 4511 calls, 10085 batches, 260013 experts, 779671 rows, 28.102 s on GPU | refused 0, absent 0

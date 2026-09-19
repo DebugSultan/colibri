@@ -1,0 +1,6 @@
+PEAK RSS: 55.49 GB
+[qtier]   dev 0: hits 0 | 335 tensors, 1.94 GB VRAM used (1.94 GB trunk + experts, budget 12.30 GB)
+[qtier]   dev 1: hits 0 | 218 tensors, 2.04 GB VRAM used (2.04 GB trunk + experts, budget 12.30 GB)
+[qtier] VRAM hit rate: 0.0 % | LFRU swaps 0
+Expert cache hit rate: 96.3% (hit=534062 miss=20766)
+Speed: 0.19 tok/s (333.2s for 64 tokens)

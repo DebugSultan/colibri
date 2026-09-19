@@ -1,0 +1,17 @@
+arm            : trunk
+extra env      : Q38_TIER_TRUNK=1
+exit code      : 0
+wall seconds   : 345.45
+swap regime    : off
+pswpin delta   : 0 pages
+pswpout delta  : 0 pages
+--- last /proc/<pid>/io sample ---
+rchar: 188412
+wchar: 3
+syscr: 202
+syscw: 1
+read_bytes: 3837952
+write_bytes: 0
+cancelled_write_bytes: 0
+--- expert I/O counters ---
+[qwen38 expert I/O] weight-ranges=41532 scale-ranges=96 coalesced-gate-up=20766 prefetched=41532 parallel-batches=2056 resident-scales=28.12 MiB

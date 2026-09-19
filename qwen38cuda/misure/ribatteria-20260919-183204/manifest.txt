@@ -1,0 +1,9 @@
+date        : 2026-09-19T18:32:06+02:00
+HEAD        : ba06dd6902c29f794f14fa8d7670b0f24623a3fd qwen38cuda: fmt=9 PR prepared against upstream/dev@5a0b725, fixed-regime rebattery protocol, CUDA binary rebuilt from HEAD
+binary mtime: 2026-09-19 17:55:56.380237770 +0200
+swap mode   : off
+prompt      : prompt-2k.txt
+arms        : ours hybrid trunk hybrid_pf
+shape       : cache=8192 bits=8 N_NEW=64 OMP=20 reserve=1024MB
+kernel      : 7.0.0-31-generic
+swappiness  : 1

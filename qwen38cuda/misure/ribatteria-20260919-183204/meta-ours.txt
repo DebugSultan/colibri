@@ -1,0 +1,17 @@
+arm            : ours
+extra env      : <none>
+exit code      : 0
+wall seconds   : 355.48
+swap regime    : off
+pswpin delta   : 0 pages
+pswpout delta  : 0 pages
+--- last /proc/<pid>/io sample ---
+rchar: 188393
+wchar: 3
+syscr: 202
+syscw: 1
+read_bytes: 2490368
+write_bytes: 0
+cancelled_write_bytes: 0
+--- expert I/O counters ---
+[qwen38 expert I/O] weight-ranges=44850 scale-ranges=0 coalesced-gate-up=22425 prefetched=22652 parallel-batches=1258 resident-scales=0.00 MiB

@@ -1,0 +1,17 @@
+arm            : hybrid
+extra env      : Q38_TIER_TRUNK=2
+exit code      : 0
+wall seconds   : 355.67
+swap regime    : off
+pswpin delta   : 0 pages
+pswpout delta  : 0 pages
+--- last /proc/<pid>/io sample ---
+rchar: 188406
+wchar: 3
+syscr: 202
+syscw: 1
+read_bytes: 2768896
+write_bytes: 0
+cancelled_write_bytes: 0
+--- expert I/O counters ---
+[qwen38 expert I/O] weight-ranges=44850 scale-ranges=96 coalesced-gate-up=22425 prefetched=22652 parallel-batches=1258 resident-scales=28.12 MiB

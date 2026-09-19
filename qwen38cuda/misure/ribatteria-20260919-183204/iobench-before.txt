@@ -1,0 +1,1 @@
+O_DIRECT x10 threads: 64 reads x 4.703 MB = 0.3 GB in 0.06s -> 5.73 GB/s (0.9 effective ms/block)
