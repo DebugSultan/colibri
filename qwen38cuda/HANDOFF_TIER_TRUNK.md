@@ -104,15 +104,48 @@ cache: le due configurazioni **non sono confrontabili a parità di `cap`**. La
 controprova è stata rifatta a `cap=32` (RSS 11,8 GB dopo il load). Se progetti un
 A/B su `COLI_MAP_EXPERTS`, il `cap` va riscalato o la misura muore.
 
-## 7. Domande aperte che lascio a chi prende il testimone
+## 7. Decisione presa — ⑥ è chiuso (19/09, titolare)
 
-1. **Vale la pena accendere davvero il confronto?** Servirebbe un ponte int4 →
-   `qt_note`, cioè o una variante della guardia che accetti slot int4, o una
-   de-quantizzazione verso FP8 al momento della note. Il secondo costa banda e
-   probabilmente annulla il motivo per cui usiamo int4. Il primo è un lavoro su
-   codice upstream con un formato che upstream non conosce.
-2. **Oppure si dichiara chiuso.** Le due torri risolvono lo stesso problema in
-   modi incompatibili; si può registrare che il confronto sugli esperti non è
-   ottenibile senza snaturare una delle due, e smettere di cercarlo.
-   La mia raccomandazione è questa, ma la decisione è del titolare.
-3. In ogni caso **il numero da non riusare senza etichetta** è il −12,39 %.
+Il debito si chiude qui: **il ponte int4 → `qt_note` non si costruisce.** Le
+domande che restavano aperte sono state decise, e il motivo non è di gusto, è
+nei contatori.
+
+Il ponte avrebbe avuto solo due forme, entrambe perdenti:
+
+1. **Soddisfare la guardia caricando anche l'FP8 nativo** — raddoppia i byte per
+   esperto (2,64 → 6,02 MB) e cancella esattamente il guadagno per cui il
+   container int4 esiste: il +38 % end-to-end della A/B a container completo era
+   guadagno byte-contabile.
+2. **Insegnare a upstream il `fmt=4` gs64** — lavoro dentro il loro albero su un
+   formato che è nostro, e che dovrebbero mantenere loro.
+
+E soprattutto **il premio non c'è**, il che rende la scelta indipendente dal
+costo del ponte. Le due misure che lo dicono:
+
+- il controllo positivo (stesso braccio, tolto il solo `Q38_INT4_SNAP`) sveglia
+  davvero il tier di upstream — `resident 115/24576`, `uploads 115`, hit rate
+  **4,9 %** — e quella run ha fatto **TTFT 329,06 s**;
+- il braccio `trunk` puro, con **prefetch totale** (`prefetched=41532` su 41532
+  weight-range) e cache hit rate **96,3 %**, cioè con le carte migliori, resta
+  **−12,39 %**.
+
+Portare gli esperti int4 dentro quella torre significherebbe quindi spendere
+banda o lavoro upstream per entrare in un percorso che nel nostro regime è più
+lento del nostro.
+
+**Cosa NON viene abbandonato**, perché la parola «tier» confonde due cose: il
+container `fmt=4` gs64, il loader `Q38_INT4_SNAP`, il kernel AVX2 (a S=1 batte
+l'fp8 di 1,49–1,61×) e **la nostra arena VRAM** restano in pieno servizio. Con
+`Q38_INT4_SNAP` attivo il *nostro* tier fa hit rate **92,1 %** e tiene il
+**70,1 %** del lavoro esperti sulle schede: gli esperti int4 sono già residenti e
+già serviti dalle GPU. Del trunk teniamo il pezzo che vince davvero, il **denso
+int8**, attivo in ogni braccio e miglior denso mai misurato qui (42,4+33,2 contro
+100,6+69,9 ms/fwd).
+
+L'unica frase che si chiude è: *gli esperti int4 non passeranno mai per
+`qt_note` di upstream*.
+
+**Resta in piedi, e vale per chiunque legga:** il −12,39 % è **il numero da non
+riusare senza etichetta**. Misurava il trunk *denso* con l'expert tier di
+upstream irraggiungibile; sugli esperti il confronto fra le due torri non è mai
+avvenuto.
