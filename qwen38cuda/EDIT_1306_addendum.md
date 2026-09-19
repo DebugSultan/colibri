@@ -3,15 +3,23 @@
 Commento da **modificare** (mai postarne un secondo, regola di campagna):
 https://github.com/JustVugg/colibri/issues/1306#issuecomment-5736198159
 
-Il PATCH via API restituisce `403 Resource not accessible by personal access
-token`: l'account `DebugSultan` ha solo `pull` su `JustVugg/colibri` e il PAT
-fine-grained non porta `Issues: write` sui repo di terzi. Serve un token classico
-con scope `repo`/`public_repo`, oppure l'incolla manuale del testo qui sotto in
-coda al commento esistente.
+**APPLICATO il 19/09 alle 19:11:40Z.** Il commento esistente e' stato modificato
+in-place (id invariato `5736198159`, `user: DebugSultan`, #1306 resta a 6
+commenti: nessun secondo commento e' stato postato).
 
-Testo gia' pronto anche come JSON pronto da inviare:
-`gh api --method PATCH repos/JustVugg/colibri/issues/comments/5736198159 --input body-1306.json`
-(il JSON contiene il corpo COMPLETO, vecchio + integrazione).
+Nota sul blocco che c'era: il PATCH rispondeva `403 Resource not accessible by
+personal access token` perche' l'account `gh` attivo era il PAT fine-grained,
+senza `Issues: write` sui repo di terzi. Nel `hosts.yml` esiste una seconda voce
+etichettata `laserpollo` che pero' e' **lo stesso account GitHub** (`gh api user`
+risponde `login: DebugSultan`, id 99316470) con un token classico scope `repo`:
+e' quello che porta i permessi di scrittura. Se un gesto verso upstream torna
+403, la prima cosa da provare e' `gh auth switch --user laserpollo`.
+
+Comando usato (il JSON contiene il corpo COMPLETO, vecchio + integrazione):
+`gh api --method PATCH repos/JustVugg/colibri/issues/comments/5736198159 --input pr-fmt9/body-1306.json`
+
+La frase di chiusura e' stata aggiornata prima dell'invio: la PR fmt=9 non e'
+piu' "ready and lands next" ma e' aperta come JustVugg/colibri#1620.
 
 ---
 ---
