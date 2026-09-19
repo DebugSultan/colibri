@@ -24,10 +24,12 @@ This adds the missing decode: `fmt=9` in `coli_cuda_matmul`.
 
 `fmt=9` carries its magnitude in the weights, so like `fmt=0` (f32) and `fmt=6`
 (E8, scales inside the block) it has no scale array to allocate, upload, charge
-against the device budget or refresh. Upstream spells that rule out by hand as
-`fmt && fmt != 6` at seven call sites plus a longer variant in the matmul
-epilogue. Adding a fourth scale-free format to eight hand-written lists is how
-those lists drift, so this PR consolidates them into one predicate:
+against the device budget or refresh. Upstream spells that rule out by hand, and
+in more than one wording: `fmt && fmt != 6` at seven call sites, a longer variant
+in the matmul epilogue, and `!fmt || fmt==6` — the same rule read backwards
+— in `coli_cuda_tensor_update`. Adding a fourth scale-free format to nine
+hand-written lists spelled two different ways is how such lists drift, so this PR
+consolidates them into one predicate:
 
 ```c
 __host__ __device__ static int fmt_scale_free(int fmt) {
@@ -36,13 +38,19 @@ __host__ __device__ static int fmt_scale_free(int fmt) {
 ```
 
 Every converted site keeps the same truth table for formats 0..8, so no existing
-container changes behaviour. Two of the conversions are defensive rather than
-observable today:
+container changes behaviour. Three of the conversions deserve a note:
 
+* `coli_cuda_tensor_update()` is the one that mattered. It ended in
+  `return !tensor->fmt || tensor->fmt==6 || cudaMemcpy(tensor->scales, scales, ...)`.
+  That is the scale-free rule written in the opposite direction, so a sweep for
+  `fmt && fmt != 6` never surfaces it, and `fmt=9` fell straight through to a
+  memcpy from a NULL host pointer — `invalid argument` on the first in-place
+  refresh. The test below caught it, and that is the concrete reason this PR
+  consolidates the rule instead of adding a ninth hand-written list.
 * `absorb_scale()` tested `!fmt` and would have read `wscale[row]` for a
   scale-free format. It is unreachable in practice — `absorb_fmt_ok()` gates the
   absorb kernels on `coli_cuda_weight_at_supported()`, which admits `{0,1,2,3,4}`
-  only — so this is hardening, not a fix for a live bug.
+  only — so this one is hardening, not a fix for a live bug.
 * the matmul epilogue already excluded `fmt != 6` explicitly; routing it through
   the predicate is what keeps `fmt=9` out of `partial[0] * scales[o]`, where
   `scales` is `NULL`.
@@ -64,7 +72,9 @@ falsifiable claims:
 2. **PARITY** — `coli_cuda_matmul(fmt=9)` against a `double` CPU reference on a
    shape with an odd `I` (tail) and `S > 1`.
 3. **SCALE-FREE** — upload with `scales == NULL`, `coli_cuda_tensor_bytes ==
-   I*O*2`, refresh with a NULL scale pointer.
+   I*O*2`, and an in-place `coli_cuda_tensor_update()` with a NULL scale pointer.
+   This claim is not decorative: it failed on the first run, and that failure is
+   what exposed the `!fmt || fmt==6` site above.
 4. **NEGATIVE CONTROL** — a scaled format (`fmt=1`) with `scales == NULL` must
    still be refused, so claim 3 cannot pass by the guard being gone.
 

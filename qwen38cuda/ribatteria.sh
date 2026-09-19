@@ -95,11 +95,18 @@ preflight() {
   if [ -x "$BIN" ]; then
     if ldd "$BIN" | grep -q libcudart; then echo "  [ok] binary is CUDA-linked"
     else echo "  [x] $BIN is NOT CUDA-linked -- run: make -C $REPO/c CUDA=1 qwen38"; fail=1; fi
-    local head_t bin_t
-    head_t=$(git -C "$REPO" log -1 --format=%ct)
+    # Compare against the last commit that touched c/, not against HEAD: a
+    # register or document commit must not invalidate a good binary. Uncommitted
+    # edits under c/ count too -- they are code the binary does not contain.
+    local head_t bin_t dirty
+    head_t=$(git -C "$REPO" log -1 --format=%ct -- c/)
     bin_t=$(stat -c %Y "$BIN")
-    if [ "$bin_t" -ge "$head_t" ]; then echo "  [ok] binary newer than HEAD"
-    else echo "  [x] $BIN predates HEAD -- rebuild before measuring"; fail=1; fi
+    dirty=$(git -C "$REPO" status --porcelain -- c/ | grep -v '^?? ' | wc -l)
+    if [ "$bin_t" -lt "$head_t" ]; then
+      echo "  [x] $BIN predates the last c/ commit -- rebuild before measuring"; fail=1
+    elif [ "$dirty" -ne 0 ]; then
+      echo "  [x] $dirty tracked file(s) under c/ modified since the build -- rebuild or stash"; fail=1
+    else echo "  [ok] binary newer than the last c/ commit, c/ clean"; fi
   fi
 
   # 4. no concurrent writer on the same NVMe (rule 4 of HANDOFF_FINESTRA: a

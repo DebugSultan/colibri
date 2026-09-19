@@ -1,4 +1,5 @@
-diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
+diff --git a/c/backend_cuda.cu b/c/backend_cuda.cu
+index 07d5dfc42..632337dd2 100644
 --- a/c/backend_cuda.cu
 +++ b/c/backend_cuda.cu
 @@ -176,6 +176,15 @@
@@ -106,7 +107,24 @@ diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
  #ifdef COLI_ANS
      if(tensor->compressed) return 0;
  #endif
-@@ -2398,7 +2423,7 @@
+@@ -1634,9 +1659,13 @@
+             (uint8_t*)tensor->weights,tensor->weight_bytes);
+         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
+     }
+-    /* fmt=6 has no scale buffer at all (scales live in-block, scale_count 0), and
+-     * the fallback below would otherwise copy O floats out of a NULL host pointer. */
+-    return !tensor->fmt || tensor->fmt==6 || cuda_ok(cudaMemcpy(tensor->scales,scales,
++    /* Scale-free formats have no scale buffer to refresh: fmt=6 keeps its scales
++     * in-block (scale_count 0), fmt=0 and fmt=9 carry their magnitude in the
++     * weights. The fallback below would otherwise copy O floats out of a NULL
++     * host pointer. Spelled through the shared predicate on purpose: this site
++     * used to say `!fmt || fmt==6`, a second wording of the same rule that the
++     * `fmt && fmt != 6` sweep would not have caught. */
++    return fmt_scale_free(tensor->fmt) || cuda_ok(cudaMemcpy(tensor->scales,scales,
+         (tensor->scale_count?tensor->scale_count:(size_t)tensor->O)*sizeof(float),
+         cudaMemcpyHostToDevice),"scale refresh");
+ }
+@@ -2398,7 +2427,7 @@
  #endif
              tensor->weight_bytes;
          size_t bytes = storage_bytes +
@@ -115,7 +133,7 @@ diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
          if (ctx->tensor_count) ctx->tensor_count--;
          if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
      }
-@@ -2422,7 +2447,7 @@
+@@ -2422,7 +2451,7 @@
  #endif
          tensor->weight_bytes;
      return storage_bytes +
@@ -124,7 +142,7 @@ diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
  }
  
  /* What a cudaMalloc of `bytes` actually takes off the card.
-@@ -2535,7 +2560,7 @@
+@@ -2535,7 +2564,7 @@
  #endif
          tensor->weight_bytes;
      size_t total = coli_cuda_alloc_footprint(storage_bytes);
@@ -133,7 +151,8 @@ diff -ruN orig/c/backend_cuda.cu updev/c/backend_cuda.cu
          total += coli_cuda_alloc_footprint(tensor->scale_count * sizeof(float));
      return total;
  }
-diff -ruN orig/c/backend_cuda.h updev/c/backend_cuda.h
+diff --git a/c/backend_cuda.h b/c/backend_cuda.h
+index 953e8b39f..14d1699aa 100644
 --- a/c/backend_cuda.h
 +++ b/c/backend_cuda.h
 @@ -42,8 +42,10 @@
@@ -164,7 +183,8 @@ diff -ruN orig/c/backend_cuda.h updev/c/backend_cuda.h
   * The first successful call uploads W and its scales; later calls reuse it.
   * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
   */
-diff -ruN orig/c/Makefile updev/c/Makefile
+diff --git a/c/Makefile b/c/Makefile
+index 3d81868e6..ada397841 100644
 --- a/c/Makefile
 +++ b/c/Makefile
 @@ -944,7 +944,7 @@
@@ -192,7 +212,9 @@ diff -ruN orig/c/Makefile updev/c/Makefile
  	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
  	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
  	# itself (kernel-level oracle), so only the test file is compiled.
-diff -ruN orig/c/tests/test_bf16_cuda.cu updev/c/tests/test_bf16_cuda.cu
+diff --git a/c/tests/test_bf16_cuda.cu b/c/tests/test_bf16_cuda.cu
+new file mode 100644
+index 0000000..88ce13b3b
 --- /dev/null
 +++ b/c/tests/test_bf16_cuda.cu
 @@ -0,0 +1,149 @@
