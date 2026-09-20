@@ -14,6 +14,9 @@ typedef struct {
     Dsv4CudaTensor *compress_wkv,*compress_wgate,*compress_ape,*compress_norm;
 } Dsv4CudaAttentionWeights;
 int dsv4_cuda_init(const int *devices,int count);
+/* Domain:bus:device.function of a CUDA device (13+ byte buffer), for reading
+ * the PCIe link width from sysfs. Returns 0 on failure. */
+int dsv4_cuda_device_pci_bus_id(int device,char *out,int size);
 void dsv4_cuda_shutdown(void);
 int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
@@ -207,6 +210,10 @@ int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet *set,int expert,
         const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,
         const uint8_t*dw,const uint8_t*ds,
         Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down);
+/* Clear one bank slot so it contributes an exact zero row: the split-device
+ * path parks the peer device's routes on a filler slot with weight 0, and the
+ * weight lands after FC1. */
+int dsv4_cuda_expert_bank_zero(Dsv4CudaExpertSet *set,int expert);
 int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *gate_weight,const uint8_t *gate_scale,
                                      const uint8_t *up_weight,const uint8_t *up_scale,
@@ -228,6 +235,12 @@ int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation *input,Dsv4CudaTensor *g
 int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation *input,const int *ids,
                                   const float *weights,int count,Dsv4CudaExpertSet *experts,
                                   float limit,Dsv4CudaActivation *output);
+/* Same, with the shared experts made optional: with_shared=0 writes the routed
+ * half only. Two devices splitting one chunk both call this and their outputs
+ * are summed, so exactly one may add the shared part. */
+int dsv4_cuda_route_moe_ids_batch_ex(const Dsv4CudaActivation *input,const int *ids,
+                                     const float *weights,int count,Dsv4CudaExpertSet *experts,
+                                     float limit,Dsv4CudaActivation *output,int with_shared);
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                             const Dsv4CudaActivation *peer_input,Dsv4CudaTensor *peer_gate,Dsv4CudaTensor *peer_bias,
                             int token,float routed_scale,Dsv4CudaExpertSet *local,Dsv4CudaExpertSet *peer,

@@ -705,6 +705,13 @@ extern "C" int dsv4_cuda_backend_arch_ok(int device){
     return prop.major>=6;
 #endif
 }
+/* The device's PCI bus id, so the host can read the link width out of sysfs:
+ * the two-GPU expert split is bandwidth-bound on the upload, and an even split
+ * across an x16 and an x8 card is slower than not splitting at all. */
+extern "C" int dsv4_cuda_device_pci_bus_id(int device,char*out,int size){
+    if(!out||size<13)return 0;
+    return ok(cudaDeviceGetPCIBusId(out,size,device),"query device PCI bus id")?1:0;
+}
 extern "C" const char *dsv4_cuda_backend_name(void){
 #ifdef COLI_DSV4_DEEPGEMM
     return "deepgemm-sm120";
@@ -2009,6 +2016,31 @@ extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
     return bank_upload_stream(set,e,gw,gs,uw,us,dw,ds,gate,up,down,0);
 }
 
+/* Clear one bank slot. The split-device path maps every route owned by the
+ * peer device onto a filler slot carrying weight 0, and the route weight is
+ * only applied after FC1 -- so 0 * NaN would poison the reduction if the slot
+ * still held whatever its allocation came with. Zeroed fp4 weights and zeroed
+ * e4m3 scales make the filler emit an exact zero row; the DeepGEMM scales are
+ * re-packed from the cleared bytes so the grouped GEMM sees them too. */
+extern "C" int dsv4_cuda_expert_bank_zero(Dsv4CudaExpertSet*set,int e){
+    if(!set||e<0||e>=set->count||!set->bank_fc1||!set->bank_fc1_scale||!set->bank_fc2||!set->bank_fc2_scale||
+       !ok(cudaSetDevice(set->device),"select expert bank zero device"))return 0;
+    Dev*c=ctx(set->device);if(!c)return 0;
+    int H=set->H,I=set->I;size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
+    uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
+    uint8_t*fc2=set->bank_fc2+(size_t)e*w2,*fc2s=set->bank_fc2_scale+(size_t)e*s2;
+    if(!ok(cudaMemsetAsync(fc1,0,2*w1,c->stream),"expert slot fc1 clear")||
+       !ok(cudaMemsetAsync(fc1s,0,2*s1,c->stream),"expert slot fc1 scale clear")||
+       !ok(cudaMemsetAsync(fc2,0,w2,c->stream),"expert slot fc2 clear")||
+       !ok(cudaMemsetAsync(fc2s,0,s2,c->stream),"expert slot fc2 scale clear"))return 0;
+#ifdef COLI_DSV4_DEEPGEMM
+    dg_pack_weight_scale<<<(2*I*(H/32/4)+255)/256,256,0,c->stream>>>(set->bank_fc1_dg_scale,fc1s,e,2*I,H/32);
+    dg_pack_weight_scale<<<(H*(I/32/4)+255)/256,256,0,c->stream>>>(set->bank_fc2_dg_scale,fc2s,e,H,I/32);
+    if(!ok(cudaGetLastError(),"expert slot DeepGEMM scale packing"))return 0;
+#endif
+    return ok(cudaStreamSynchronize(c->stream),"expert slot clear drain")?1:0;
+}
+
 /* Double-buffer prefetch: same upload, aux stream (overlaps the compute
  * stream), drained before return. */
 extern "C" int dsv4_cuda_expert_bank_upload_aux(Dsv4CudaExpertSet*set,int e,
@@ -2176,7 +2208,12 @@ extern "C" int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation*input,Dsv4Cud
 /* Batched MoE over host-provided routes (ids/weights per token, 6 each).
  * The caller guarantees every id's bank slot holds that expert's weights;
  * routed sum and the shared expert land in output like route_moe_batch. */
-extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,const int*ids,const float*weights,int count,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
+/* with_shared=0 leaves the two shared experts out and writes routed-only
+ * output. The split-device path needs it: both devices run the routed half of
+ * the same chunk and their outputs are summed, so exactly one of them may add
+ * the shared contribution -- and the peer device then needs no shared mirrors
+ * of its own. */
+extern "C" int dsv4_cuda_route_moe_ids_batch_ex(const Dsv4CudaActivation*input,const int*ids,const float*weights,int count,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output,int with_shared){
 #ifdef COLI_DSV4_DEEPGEMM
     Dev*c=input?ctx(input->device):nullptr;
     if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
@@ -2194,13 +2231,15 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);ta=std::chrono::steady_clock::now();}
     if(!dg_moe_batch_contiguous(c,set,input->data,c->expert_ids,c->expert_weights,count,limit,output->data,ids))return 0;
     if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_expert=std::chrono::duration<double>(tb-ta).count();ta=tb;}
-    Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;if(!sg||!su||!sd||sg->O!=2048||su->O!=2048||sd->I!=2048)return 0;
-    size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);
-    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
-    if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;
-    swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);
-    if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;
-    add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
+    if(with_shared){
+        Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;if(!sg||!su||!sd||sg->O!=2048||su->O!=2048||sd->I!=2048)return 0;
+        size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);
+        if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+        if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;
+        swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);
+        if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;
+        add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
+    }
     if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_shared=std::chrono::duration<double>(tb-ta).count();
         fprintf(stderr,"[DSV4 CUDA] moe-ids prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
     return ok(cudaGetLastError(),"batched MoE ids launch");
@@ -2219,7 +2258,7 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     const int H=4096,I=2048,K=6;int routes=count*K;
     for(int r=0;r<routes;r++)if(ids[r]<0||ids[r]>=set->count)return 0;
     Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;
-    if(!sg||!su||!sd||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->O!=I||su->O!=I||sd->I!=I||sg->I!=H||sd->O!=H)return 0;
+    if(with_shared&&(!sg||!su||!sd||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->O!=I||su->O!=I||sd->I!=I||sg->I!=H||sd->O!=H))return 0;
     size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
     size_t rb=(size_t)routes*I*sizeof(float),pb=(size_t)routes*H*sizeof(float),wb=(size_t)routes*sizeof(float);
     if(!buf((void**)&c->p1,&c->p1cap,rb)||!buf((void**)&c->p2,&c->p2cap,rb)||!buf((void**)&c->p3,&c->p3cap,rb)||
@@ -2245,15 +2284,20 @@ extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,cons
     expert_reduce_rows<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count,K,H);
     /* shared experts (fp8 dense) over the whole chunk, then the same combine
      * as decode: routed = bf16(routed + bf16(shared)). */
-    size_t mid=(size_t)count*I*sizeof(float),hb=(size_t)count*H*sizeof(float);
-    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
-    run_mm_batch(sg,input->data,c->p1,count,c->stream);run_mm_batch(su,input->data,c->p2,count,c->stream);
-    expert_act_rows1<<<((long long)count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count*I);
-    fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
-    run_mm_batch(sd,c->p3,c->p4,count,c->stream);
-    moe_combine<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count*H);
+    if(with_shared){
+        size_t mid=(size_t)count*I*sizeof(float),hb=(size_t)count*H*sizeof(float);
+        if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+        run_mm_batch(sg,input->data,c->p1,count,c->stream);run_mm_batch(su,input->data,c->p2,count,c->stream);
+        expert_act_rows1<<<((long long)count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count*I);
+        fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+        run_mm_batch(sd,c->p3,c->p4,count,c->stream);
+        moe_combine<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count*H);
+    }
     return ok(cudaGetLastError(),"generic batched MoE launch");
 #endif
+}
+extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,const int*ids,const float*weights,int count,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
+    return dsv4_cuda_route_moe_ids_batch_ex(input,ids,weights,count,set,limit,output,1);
 }
 extern "C" int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
         const Dsv4CudaActivation*peer_input,Dsv4CudaTensor*peer_gate,Dsv4CudaTensor*peer_bias,int token,float scale,

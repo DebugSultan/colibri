@@ -9776,14 +9776,35 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
 static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                           ColiExpertView *view, int sync);
 
+/* Second CUDA device for the expert-parallel MoE split, -1 when the run is
+ * single-GPU. Set once by coli_v4_gpu_engine_open from DSV4_CUDA_DEVICE="a,b";
+ * the batched MoE reads it to decide whether the split path can open. */
+static int v4_gpu_device2 = -1;
+
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
     engine->gpu.enabled = 0;
     engine->gpu.device = 0;
+    v4_gpu_device2 = -1;
     if (!v4_gpu_wanted()) return 0;
+    /* DSV4_CUDA_DEVICE takes "a" or "a,b": the first is the primary (every
+     * dense mirror and the router live there), the second only ever holds a
+     * slice of the routed experts for the batched MoE. */
     const char *device_setting = getenv("DSV4_CUDA_DEVICE");
-    int device = device_setting ? atoi(device_setting) : 0;
-    if (!dsv4_cuda_init(&device, 1)) {
+    int devices[2] = {device_setting ? atoi(device_setting) : 0, -1};
+    int device_count = 1;
+    if (device_setting) {
+        const char *comma = strchr(device_setting, ',');
+        if (comma && comma[1]) {
+            int second = atoi(comma + 1);
+            if (second >= 0 && second != devices[0]) {
+                devices[1] = second;
+                device_count = 2;
+            }
+        }
+    }
+    int device = devices[0];
+    if (!dsv4_cuda_init(devices, device_count)) {
         fprintf(stderr, "v4_gpu warning=backend-unavailable; continuing-CPU\n");
         return 0;
     }
@@ -9796,6 +9817,19 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
                 dsv4_cuda_backend_name(), device);
         dsv4_cuda_shutdown();
         return 0;
+    }
+    if (device_count == 2) {
+        /* A second card that cannot run these kernels is not fatal: drop it
+         * and stay single-GPU rather than refusing the tier outright. */
+        if (dsv4_cuda_backend_arch_ok(devices[1])) {
+            v4_gpu_device2 = devices[1];
+            fprintf(stderr, "v4_gpu devices=%d,%d (split-capable)\n",
+                    device, v4_gpu_device2);
+        } else {
+            fprintf(stderr, "v4_gpu warning=device %d unsupported by %s; "
+                            "staying single-GPU\n",
+                    devices[1], dsv4_cuda_backend_name());
+        }
     }
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
@@ -10663,6 +10697,24 @@ static int v4_bank_double_on(void) {
     return on;
 }
 
+/* Two-GPU expert-split state. Declared up here because the prefetch worker
+ * and the release path both need it; the split itself is further down, with
+ * the batched MoE that drives it. */
+static Dsv4CudaExpertSet *v4_moe_split_bank;
+static unsigned char v4_moe_split_valid[256];
+static Dsv4CudaActivation *v4_moe_split_in, *v4_moe_split_out;
+static float *v4_moe_split_host;
+static int v4_moe_split_failed;
+static int v4_moe_split_active;
+static int v4_moe_split_share_permille = 500;
+
+/* Bresenham dithering: expert e belongs to the second device when the share
+ * accumulator ticks over at e. Selects exactly floor(n*share/1000) of any
+ * prefix, spread evenly rather than in a block. */
+static int v4_moe_split_owner_b(int expert, int share) {
+    return ((expert + 1) * share) / 1000 != (expert * share) / 1000;
+}
+
 static void *v4_bank2_worker(void *argument) {
     (void)argument;
     ColiExpertStore *store = v4_bank2_job.store;
@@ -10670,6 +10722,12 @@ static void *v4_bank2_worker(void *argument) {
     memset(v4_bank2_valid, 0, sizeof(v4_bank2_valid));
     int loaded = 0;
     for (int expert = 0; expert < 256; expert++) {
+        /* Under the split the peer owns part of the layer, and this bank will
+         * never be asked for those experts: prefetching them buys nothing and
+         * spends the link the split exists to unclog. */
+        if (v4_moe_split_active &&
+            v4_moe_split_owner_b(expert, v4_moe_split_share_permille))
+            continue;
         ColiExpertView view;
         memset(&view, 0, sizeof(view));
         if (coli_expert_lookup(store, (ColiExpertKey){layer, expert},
@@ -10739,12 +10797,285 @@ void coli_v4_gpu_moe_batch_release(void) {
         dsv4_cuda_expert_set_free(v4_moe_bank2);
         v4_moe_bank2 = NULL;
     }
+    if (v4_moe_split_bank) {
+        dsv4_cuda_expert_set_free(v4_moe_split_bank);
+        v4_moe_split_bank = NULL;
+    }
+    if (v4_moe_split_in) {
+        dsv4_cuda_activation_free(v4_moe_split_in);
+        v4_moe_split_in = NULL;
+    }
+    if (v4_moe_split_out) {
+        dsv4_cuda_activation_free(v4_moe_split_out);
+        v4_moe_split_out = NULL;
+    }
+    free(v4_moe_split_host);
+    v4_moe_split_host = NULL;
+    v4_moe_split_active = 0;
+    v4_moe_split_failed = 0;
+    memset(v4_moe_split_valid, 0, sizeof(v4_moe_split_valid));
     if (!v4_moe_bank) return;
     dsv4_cuda_expert_set_free(v4_moe_bank);
     v4_moe_bank = NULL;
     v4_moe_bank_layer = -1;
     v4_moe_bank_hash_layer = -1;
     memset(v4_moe_bank_valid, 0, sizeof(v4_moe_bank_valid));
+}
+
+/* Route-aware refill of one expert bank: upload the experts this chunk routes
+ * to that the bank does not already hold for this layer. Shared by the
+ * single-device path and by both halves of the two-GPU split, which call it
+ * concurrently on their own bank, valid map and missing list. Returns 0 on
+ * success, -1 when the chunk must fall back to the CPU union. */
+static int v4_moe_bank_refill(ColiExpertStore *store, int layer,
+                              Dsv4CudaExpertSet *target, unsigned char *valid,
+                              const int *missing, int missing_count,
+                              const char *tag, int halve_pins) {
+    /* The expert cache has a bounded number of pin slots (target_slots
+     * can be as low as single digits under memory pressure), so the
+     * refill must never hold many views at once: fetch small groups in
+     * parallel, upload, release, repeat. Holding all missing views
+     * simultaneously makes the later lookups fail outright. */
+    enum { V4_MOE_REFILL_GROUP_MAX = 16 };
+    /* Group size trades refill I/O parallelism (each lookup is a cold
+     * O_DIRECT read; two NVMe drives want queue depth) against the expert
+     * cache's bounded pin slots (target_slots can be ~22; holding more
+     * views than free slots makes lookups fail outright). Default 6 is
+     * safe under memory pressure; V4_MOE_REFILL_GROUP raises it. */
+    static int group_size = 0;
+    if (!group_size) {
+        /* Clamp in a local and publish once: both halves of a two-GPU split
+         * may run this at the same time, and a reader that caught a
+         * half-clamped value would overrun the view arrays below. */
+        const char *setting = getenv("V4_MOE_REFILL_GROUP");
+        int size = setting ? atoi(setting) : 6;
+        if (size < 1) size = 1;
+        if (size > V4_MOE_REFILL_GROUP_MAX) size = V4_MOE_REFILL_GROUP_MAX;
+        group_size = size;
+    }
+    double t_lookup = 0.0, t_upload = 0.0;
+    struct timespec _t0, _t1;
+    int refill_failed = 0;
+    /* PIPELINED refill: the lookups of group g+1 (parallel O_DIRECT reads)
+     * run concurrently with the uploads of group g (single-stream
+     * cudaMemcpy) — one dynamic-scheduled parallel loop whose item 0 is
+     * the upload of the previous group. Two groups' views are held at
+     * once, so the group size is halved against the pin-slot budget. */
+    /* Two in-flight groups: cap so 2*pipe_group stays under the pin
+     * budget group_size was tuned for (12 -> 8 wide, 16 held). */
+    int pipe_group = group_size;
+    if (pipe_group > (V4_MOE_REFILL_GROUP_MAX * 2) / 3)
+        pipe_group = (V4_MOE_REFILL_GROUP_MAX * 2) / 3;
+    /* Both halves of a two-GPU split refill concurrently out of the same
+     * expert cache, so each may hold only half the pin budget. */
+    if (halve_pins) pipe_group = (pipe_group + 1) / 2;
+    if (pipe_group < 1) pipe_group = 1;
+    ColiExpertView views[2][V4_MOE_REFILL_GROUP_MAX];
+    int fetched[2][V4_MOE_REFILL_GROUP_MAX];
+    int gcount[2] = {0, 0};
+    int cur = 0;
+    /* Lookups that lose the pin-slot race (the expert cache's free slots
+     * shrink with RAM pressure and the hot pins) are not fatal: they are
+     * retried below, one view at a time, after the pipelined pass. */
+    int *retry = malloc((size_t)missing_count * sizeof(*retry));
+    int retry_count = 0;
+    if (!retry) return -1;
+    /* Prime: fetch group 0 alone. */
+    {
+        int group = missing_count < pipe_group ? missing_count : pipe_group;
+        clock_gettime(CLOCK_MONOTONIC, &_t0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < group; i++) {
+            ColiExpertKey key = {layer, missing[i]};
+            fetched[0][i] = coli_expert_lookup(store, key, &views[0][i]) == 0;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        t_lookup += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+        gcount[0] = group;
+    }
+    for (int base = 0; base < missing_count; base += pipe_group) {
+        int next_base = base + pipe_group;
+        int next_group = missing_count - next_base;
+        if (next_group > pipe_group) next_group = pipe_group;
+        if (next_group < 0) next_group = 0;
+        int nxt = cur ^ 1;
+        gcount[nxt] = next_group;
+        clock_gettime(CLOCK_MONOTONIC, &_t0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int item = 0; item < next_group + 1; item++) {
+            if (item == 0) {
+                /* Upload the current group (sequential, this thread). */
+                for (int i = 0; i < gcount[cur]; i++) {
+                    if (!fetched[cur][i]) { retry[retry_count++] = missing[base + i]; continue; }
+                    ColiExpertView view = views[cur][i];
+                    if (refill_failed) { coli_expert_release(store, &view); continue; }
+                    Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
+                    int uploaded =
+                        view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
+                        view.up.data && view.up.scales && view.up.block_rows == 1 &&
+                        view.down.data && view.down.scales && view.down.block_rows == 1 &&
+                        view.gate.rows == 2048 && view.gate.columns == 4096 &&
+                        view.up.rows == 2048 && view.up.columns == 4096 &&
+                        view.down.rows == 4096 && view.down.columns == 2048 &&
+                        dsv4_cuda_expert_bank_upload(
+                            target, missing[base + i],
+                            (const uint8_t *)view.gate.data,
+                            (const uint8_t *)view.gate.scales,
+                            (const uint8_t *)view.up.data,
+                            (const uint8_t *)view.up.scales,
+                            (const uint8_t *)view.down.data,
+                            (const uint8_t *)view.down.scales,
+                            &bg, &bu, &bd);
+                    coli_expert_release(store, &view);
+                    if (bg) dsv4_cuda_tensor_free(bg);
+                    if (bu) dsv4_cuda_tensor_free(bu);
+                    if (bd) dsv4_cuda_tensor_free(bd);
+                    if (uploaded) valid[missing[base + i]] = 1;
+                    else refill_failed = 1;
+                }
+            } else {
+                int i = item - 1;
+                ColiExpertKey key = {layer, missing[next_base + i]};
+                fetched[nxt][i] = coli_expert_lookup(store, key, &views[nxt][i]) == 0;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        t_upload += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+        cur = nxt;
+        if (refill_failed) {
+            /* Release whatever the last lookups pinned. */
+            for (int i = 0; i < gcount[cur]; i++)
+                if (fetched[cur][i]) coli_expert_release(store, &views[cur][i]);
+            break;
+        }
+    }
+    /* Sequential retry of the lookups that failed under pin pressure:
+     * nothing else is held now, so a single lookup needs one free slot. */
+    int retried = 0;
+    for (int r = 0; !refill_failed && r < retry_count; r++) {
+        ColiExpertKey key = {layer, retry[r]};
+        ColiExpertView view;
+        clock_gettime(CLOCK_MONOTONIC, &_t0);
+        if (coli_expert_lookup(store, key, &view) != 0) { refill_failed = 1; break; }
+        Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
+        int uploaded =
+            view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
+            view.up.data && view.up.scales && view.up.block_rows == 1 &&
+            view.down.data && view.down.scales && view.down.block_rows == 1 &&
+            view.gate.rows == 2048 && view.gate.columns == 4096 &&
+            view.up.rows == 2048 && view.up.columns == 4096 &&
+            view.down.rows == 4096 && view.down.columns == 2048 &&
+            dsv4_cuda_expert_bank_upload(
+                target, retry[r],
+                (const uint8_t *)view.gate.data, (const uint8_t *)view.gate.scales,
+                (const uint8_t *)view.up.data, (const uint8_t *)view.up.scales,
+                (const uint8_t *)view.down.data, (const uint8_t *)view.down.scales,
+                &bg, &bu, &bd);
+        coli_expert_release(store, &view);
+        if (bg) dsv4_cuda_tensor_free(bg);
+        if (bu) dsv4_cuda_tensor_free(bu);
+        if (bd) dsv4_cuda_tensor_free(bd);
+        if (uploaded) { valid[retry[r]] = 1; retried++; }
+        else refill_failed = 1;
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        t_upload += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
+    }
+    free(retry);
+    if (layer < 2 || retried || refill_failed)
+        fprintf(stderr, "v4_gpu moe-batch refill%s layer=%d missing=%d "
+                "lookup=%.2fs upload=%.2fs%s%s\n",
+                tag, layer, missing_count, t_lookup, t_upload,
+                retried ? " (sequential retries)" : "",
+                refill_failed ? " FAILED" : "");
+    if (refill_failed) {
+        /* Leave un-uploaded experts pending-cleared so a later chunk can
+         * retry; this chunk falls back to the CPU union. */
+        for (int i = 0; i < missing_count; i++)
+            if (valid[missing[i]] == 2) valid[missing[i]] = 0;
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- Two-GPU expert-parallel split (COLI_CUDA_MOE_SPLIT=1) ---------------
+ *
+ * The batched MoE is bound by uploading the layer's routed experts over PCIe
+ * (~1.66 GB per layer at 132 fp4 experts), not by the arithmetic. Splitting
+ * the experts across two cards halves the bytes each link carries -- but only
+ * if the partition follows the links: an even split across an x16 and an x8
+ * card leaves the x8 card moving what it would have moved alone, plus a
+ * synchronisation. So the default share of the second device is its fraction
+ * of the two cards' combined PCIe width, read out of sysfs;
+ * COLI_CUDA_MOE_SPLIT_SHARE (per mille) overrides it.
+ *
+ * Ownership is a Bresenham selection over the expert index, so the owned sets
+ * are evenly interleaved: whatever subset of experts a chunk happens to route
+ * to is divided in the same proportion as the whole.
+ *
+ * Routes the peer owns are not dropped from a device's call -- they are parked
+ * on a zeroed filler slot with weight 0, which keeps both calls on the same
+ * fixed 6-routes-per-token shape the kernels are built around. The wasted
+ * arithmetic is well under a millisecond per chunk-layer against tens of
+ * milliseconds of upload. The two outputs are summed on the host; exactly one
+ * device adds the shared experts, so nothing is counted twice. */
+
+static int v4_moe_split_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("COLI_CUDA_MOE_SPLIT");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+}
+
+/* The card's negotiated-maximum PCIe width. max_link_width, not
+ * current_link_width: an idle card drops its current width to x4 for power
+ * management, which would skew the split toward whichever card happened to be
+ * asleep when the first chunk ran. */
+static int v4_pcie_link_width(int device) {
+    char bus[32], path[96];
+    if (!dsv4_cuda_device_pci_bus_id(device, bus, (int)sizeof(bus))) return 0;
+    for (char *c = bus; *c; c++)
+        if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + ('a' - 'A'));
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/max_link_width", bus);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int width = 0;
+    if (fscanf(f, "%d", &width) != 1) width = 0;
+    fclose(f);
+    return width > 0 ? width : 0;
+}
+
+static int v4_moe_split_share(int device_a, int device_b) {
+    const char *setting = getenv("COLI_CUDA_MOE_SPLIT_SHARE");
+    if (setting) {
+        int share = atoi(setting);
+        if (share < 0) share = 0;
+        if (share > 1000) share = 1000;
+        return share;
+    }
+    int wa = v4_pcie_link_width(device_a), wb = v4_pcie_link_width(device_b);
+    if (wa > 0 && wb > 0) return (int)((1000LL * wb) / (wa + wb));
+    /* Unknown widths: an even split is the only defensible guess. */
+    return 500;
+}
+
+struct V4MoeRefillJob {
+    ColiExpertStore *store;
+    int layer;
+    Dsv4CudaExpertSet *bank;
+    unsigned char *valid;
+    const int *missing;
+    int count;
+    int result;
+};
+
+static void *v4_moe_refill_worker(void *arg) {
+    struct V4MoeRefillJob *job = (struct V4MoeRefillJob *)arg;
+    job->result = v4_moe_bank_refill(job->store, job->layer, job->bank,
+                                     job->valid, job->missing, job->count,
+                                     " peer", 1);
+    return NULL;
 }
 
 int coli_v4_gpu_moe_batch_union(float *outputs,
@@ -10833,6 +11164,14 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         }
         v4_bank2_layer = -1;
         if (!dsv4_cuda_expert_bank_set_shared(bank, sg, su, sd)) return -1;
+        if (v4_moe_split_active) {
+            /* The peer holds no expert across a layer change, and the active
+             * bank may have just arrived from the prefetch slot, where nothing
+             * zeroed the filler the split parks foreign routes on. */
+            memset(v4_moe_split_valid, 0, sizeof(v4_moe_split_valid));
+            if (!dsv4_cuda_expert_bank_zero(bank, config->n_routed_experts))
+                return -1;
+        }
         bank_layer = weights->plan.layer;
         if (double_on) {
             int next = coli_v4_bank_pair_prefetch_target(
@@ -10910,14 +11249,67 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                    config->routed_scaling_factor, ids, route_weights)) {
         return -1;
     }
+    /* Open the peer device's bank and mirrors on first use. Failing here is
+     * not fatal to the chunk: the split is given up for the rest of the run
+     * and this chunk takes the single-device path unchanged. The filler slot
+     * sits one past the last real expert, so a checkpoint that fills the bank
+     * has no room for it and cannot be split. */
+    int filler = config->n_routed_experts;
+    int split = v4_moe_split_on() && v4_gpu_device2 >= 0 &&
+                !v4_moe_split_failed && filler < V4_GPU_ROUTER_SLOTS;
+    if (split && !v4_moe_split_bank) {
+        v4_moe_split_bank = dsv4_cuda_expert_bank_create(
+            V4_GPU_ROUTER_SLOTS, 4096, 2048, v4_gpu_device2, NULL, NULL, NULL);
+        v4_moe_split_in = dsv4_cuda_activation_create(v4_gpu_device2, 128LL * 4096);
+        v4_moe_split_out = dsv4_cuda_activation_create(v4_gpu_device2, 128LL * 4096);
+        v4_moe_split_host = malloc((size_t)128 * 4096 * sizeof(float));
+        if (!v4_moe_split_bank || !v4_moe_split_in || !v4_moe_split_out ||
+            !v4_moe_split_host ||
+            !dsv4_cuda_expert_bank_zero(v4_moe_split_bank, filler) ||
+            !dsv4_cuda_expert_bank_zero(bank, filler)) {
+            fprintf(stderr, "v4_gpu moe-split=off (peer device %d setup failed; "
+                            "single-GPU stays)\n", v4_gpu_device2);
+            v4_moe_split_failed = 1;
+            split = 0;
+        } else {
+            v4_moe_split_share_permille = v4_moe_split_share(device, v4_gpu_device2);
+            v4_moe_split_active = 1;
+            memset(v4_moe_split_valid, 0, sizeof(v4_moe_split_valid));
+            fprintf(stderr,
+                    "v4_gpu moe-split=on peer=%d share=%d/1000 link=x%d,x%d\n",
+                    v4_gpu_device2, v4_moe_split_share_permille,
+                    v4_pcie_link_width(device),
+                    v4_pcie_link_width(v4_gpu_device2));
+        }
+    }
+    int share = v4_moe_split_share_permille;
     /* Upload the chunk's missing routed experts. Lookups run in parallel
      * (thread-safe; the CPU union's loaders already do this), uploads stay
-     * sequential on the single bank. */
+     * sequential on each bank. Under the split every expert belongs to exactly
+     * one device, so the two halves never upload the same bytes. */
     int missing[256], missing_count = 0;
+    int missing_b[256], missing_b_count = 0;
+    int ids_a[128 * 6], ids_b[128 * 6];
+    float weights_a[128 * 6], weights_b[128 * 6];
     for (int r = 0; r < batch * topk; r++) {
         int expert = ids[r];
         if (expert < 0 || expert >= 256) return -1;
-        if (!bank_valid[expert]) {
+        int on_b = split && v4_moe_split_owner_b(expert, share);
+        if (split) {
+            /* Both devices see every route: the ones they do not own are
+             * parked on the zeroed filler slot with weight 0, which keeps the
+             * call on the fixed routes-per-token shape the kernels want. */
+            ids_a[r] = on_b ? filler : expert;
+            weights_a[r] = on_b ? 0.0f : route_weights[r];
+            ids_b[r] = on_b ? expert : filler;
+            weights_b[r] = on_b ? route_weights[r] : 0.0f;
+        }
+        if (on_b) {
+            if (!v4_moe_split_valid[expert]) {
+                v4_moe_split_valid[expert] = 2; /* pending */
+                missing_b[missing_b_count++] = expert;
+            }
+        } else if (!bank_valid[expert]) {
             bank_valid[expert] = 2; /* pending */
             missing[missing_count++] = expert;
         }
@@ -10937,7 +11329,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             full_min = setting ? atoi(setting) : -1;
             if (full_min == 0) full_min = -1;
         }
-        if (full_min > 0 && missing_count &&
+        if (full_min > 0 && missing_count && !split &&
             v4_gpu_moe_batch_hint_tokens >= full_min) {
             int fresh_layer = 1;
             for (int e = 0; e < 256 && fresh_layer; e++)
@@ -10950,171 +11342,56 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
                     }
         }
     }
-    if (missing_count) {
-        /* The expert cache has a bounded number of pin slots (target_slots
-         * can be as low as single digits under memory pressure), so the
-         * refill must never hold many views at once: fetch small groups in
-         * parallel, upload, release, repeat. Holding all missing views
-         * simultaneously makes the later lookups fail outright. */
-        enum { V4_MOE_REFILL_GROUP_MAX = 16 };
-        /* Group size trades refill I/O parallelism (each lookup is a cold
-         * O_DIRECT read; two NVMe drives want queue depth) against the expert
-         * cache's bounded pin slots (target_slots can be ~22; holding more
-         * views than free slots makes lookups fail outright). Default 6 is
-         * safe under memory pressure; V4_MOE_REFILL_GROUP raises it. */
-        static int group_size = 0;
-        if (!group_size) {
-            const char *setting = getenv("V4_MOE_REFILL_GROUP");
-            group_size = setting ? atoi(setting) : 6;
-            if (group_size < 1) group_size = 1;
-            if (group_size > V4_MOE_REFILL_GROUP_MAX)
-                group_size = V4_MOE_REFILL_GROUP_MAX;
-        }
-        double t_lookup = 0.0, t_upload = 0.0;
-        struct timespec _t0, _t1;
-        int refill_failed = 0;
-        /* PIPELINED refill: the lookups of group g+1 (parallel O_DIRECT reads)
-         * run concurrently with the uploads of group g (single-stream
-         * cudaMemcpy) — one dynamic-scheduled parallel loop whose item 0 is
-         * the upload of the previous group. Two groups' views are held at
-         * once, so the group size is halved against the pin-slot budget. */
-        /* Two in-flight groups: cap so 2*pipe_group stays under the pin
-         * budget group_size was tuned for (12 -> 8 wide, 16 held). */
-        int pipe_group = group_size;
-        if (pipe_group > (V4_MOE_REFILL_GROUP_MAX * 2) / 3)
-            pipe_group = (V4_MOE_REFILL_GROUP_MAX * 2) / 3;
-        if (pipe_group < 1) pipe_group = 1;
-        ColiExpertView views[2][V4_MOE_REFILL_GROUP_MAX];
-        int fetched[2][V4_MOE_REFILL_GROUP_MAX];
-        int gcount[2] = {0, 0};
-        int cur = 0;
-        /* Lookups that lose the pin-slot race (the expert cache's free slots
-         * shrink with RAM pressure and the hot pins) are not fatal: they are
-         * retried below, one view at a time, after the pipelined pass. */
-        int *retry = malloc((size_t)missing_count * sizeof(*retry));
-        int retry_count = 0;
-        if (!retry) return -1;
-        /* Prime: fetch group 0 alone. */
-        {
-            int group = missing_count < pipe_group ? missing_count : pipe_group;
-            clock_gettime(CLOCK_MONOTONIC, &_t0);
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (int i = 0; i < group; i++) {
-                ColiExpertKey key = {weights->plan.layer, missing[i]};
-                fetched[0][i] = coli_expert_lookup(store, key, &views[0][i]) == 0;
-            }
-            clock_gettime(CLOCK_MONOTONIC, &_t1);
-            t_lookup += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
-            gcount[0] = group;
-        }
-        for (int base = 0; base < missing_count; base += pipe_group) {
-            int next_base = base + pipe_group;
-            int next_group = missing_count - next_base;
-            if (next_group > pipe_group) next_group = pipe_group;
-            if (next_group < 0) next_group = 0;
-            int nxt = cur ^ 1;
-            gcount[nxt] = next_group;
-            clock_gettime(CLOCK_MONOTONIC, &_t0);
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (int item = 0; item < next_group + 1; item++) {
-                if (item == 0) {
-                    /* Upload the current group (sequential, this thread). */
-                    for (int i = 0; i < gcount[cur]; i++) {
-                        if (!fetched[cur][i]) { retry[retry_count++] = missing[base + i]; continue; }
-                        ColiExpertView view = views[cur][i];
-                        if (refill_failed) { coli_expert_release(store, &view); continue; }
-                        Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
-                        int uploaded =
-                            view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
-                            view.up.data && view.up.scales && view.up.block_rows == 1 &&
-                            view.down.data && view.down.scales && view.down.block_rows == 1 &&
-                            view.gate.rows == 2048 && view.gate.columns == 4096 &&
-                            view.up.rows == 2048 && view.up.columns == 4096 &&
-                            view.down.rows == 4096 && view.down.columns == 2048 &&
-                            dsv4_cuda_expert_bank_upload(
-                                bank, missing[base + i],
-                                (const uint8_t *)view.gate.data,
-                                (const uint8_t *)view.gate.scales,
-                                (const uint8_t *)view.up.data,
-                                (const uint8_t *)view.up.scales,
-                                (const uint8_t *)view.down.data,
-                                (const uint8_t *)view.down.scales,
-                                &bg, &bu, &bd);
-                        coli_expert_release(store, &view);
-                        if (bg) dsv4_cuda_tensor_free(bg);
-                        if (bu) dsv4_cuda_tensor_free(bu);
-                        if (bd) dsv4_cuda_tensor_free(bd);
-                        if (uploaded) bank_valid[missing[base + i]] = 1;
-                        else refill_failed = 1;
-                    }
-                } else {
-                    int i = item - 1;
-                    ColiExpertKey key = {weights->plan.layer, missing[next_base + i]};
-                    fetched[nxt][i] = coli_expert_lookup(store, key, &views[nxt][i]) == 0;
-                }
-            }
-            clock_gettime(CLOCK_MONOTONIC, &_t1);
-            t_upload += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
-            cur = nxt;
-            if (refill_failed) {
-                /* Release whatever the last lookups pinned. */
-                for (int i = 0; i < gcount[cur]; i++)
-                    if (fetched[cur][i]) coli_expert_release(store, &views[cur][i]);
-                break;
-            }
-        }
-        /* Sequential retry of the lookups that failed under pin pressure:
-         * nothing else is held now, so a single lookup needs one free slot. */
-        int retried = 0;
-        for (int r = 0; !refill_failed && r < retry_count; r++) {
-            ColiExpertKey key = {weights->plan.layer, retry[r]};
-            ColiExpertView view;
-            clock_gettime(CLOCK_MONOTONIC, &_t0);
-            if (coli_expert_lookup(store, key, &view) != 0) { refill_failed = 1; break; }
-            Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
-            int uploaded =
-                view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
-                view.up.data && view.up.scales && view.up.block_rows == 1 &&
-                view.down.data && view.down.scales && view.down.block_rows == 1 &&
-                view.gate.rows == 2048 && view.gate.columns == 4096 &&
-                view.up.rows == 2048 && view.up.columns == 4096 &&
-                view.down.rows == 4096 && view.down.columns == 2048 &&
-                dsv4_cuda_expert_bank_upload(
-                    bank, retry[r],
-                    (const uint8_t *)view.gate.data, (const uint8_t *)view.gate.scales,
-                    (const uint8_t *)view.up.data, (const uint8_t *)view.up.scales,
-                    (const uint8_t *)view.down.data, (const uint8_t *)view.down.scales,
-                    &bg, &bu, &bd);
-            coli_expert_release(store, &view);
-            if (bg) dsv4_cuda_tensor_free(bg);
-            if (bu) dsv4_cuda_tensor_free(bu);
-            if (bd) dsv4_cuda_tensor_free(bd);
-            if (uploaded) { bank_valid[retry[r]] = 1; retried++; }
-            else refill_failed = 1;
-            clock_gettime(CLOCK_MONOTONIC, &_t1);
-            t_upload += (_t1.tv_sec - _t0.tv_sec) + (_t1.tv_nsec - _t0.tv_nsec) / 1e9;
-        }
-        free(retry);
-        if (weights->plan.layer < 2 || retried || refill_failed)
-            fprintf(stderr, "v4_gpu moe-batch refill layer=%d missing=%d "
-                    "lookup=%.2fs upload=%.2fs%s%s\n",
-                    weights->plan.layer, missing_count, t_lookup, t_upload,
-                    retried ? " (sequential retries)" : "",
-                    refill_failed ? " FAILED" : "");
-        if (refill_failed) {
-            /* Leave un-uploaded experts pending-cleared so a later chunk can
-             * retry; this chunk falls back to the CPU union. */
-            for (int i = 0; i < missing_count; i++)
-                if (bank_valid[missing[i]] == 2) bank_valid[missing[i]] = 0;
-            return -1;
-        }
+    if (split && missing_b_count) {
+        /* Run the peer's refill on its own thread: CUDA contexts are
+         * per-thread, so the two uploads ride their own links at the same
+         * time -- sequential refills would just add the two transfers up. */
+        struct V4MoeRefillJob peer = {store, weights->plan.layer,
+                                      v4_moe_split_bank, v4_moe_split_valid,
+                                      missing_b, missing_b_count, 0};
+        pthread_t thread;
+        int running = pthread_create(&thread, NULL, v4_moe_refill_worker,
+                                     &peer) == 0;
+        if (!running) v4_moe_refill_worker(&peer);
+        int primary = missing_count
+                          ? v4_moe_bank_refill(store, weights->plan.layer, bank,
+                                               bank_valid, missing,
+                                               missing_count, "", 1)
+                          : 0;
+        if (running) pthread_join(thread, NULL);
+        if (primary != 0 || peer.result != 0) return -1;
+    } else if (missing_count &&
+               /* Nothing refills alongside this one -- the peer either is not
+                * there or already holds every expert it owns -- so the bank
+                * keeps the whole pin budget. */
+               v4_moe_bank_refill(store, weights->plan.layer, bank, bank_valid,
+                                  missing, missing_count, "", 0) != 0) {
+        return -1;
     }
-    if (!dsv4_cuda_route_moe_ids_batch(in_mirror, ids, route_weights, batch,
-                                       bank, config->swiglu_limit,
-                                       out_mirror) ||
+    if (split &&
+        (!dsv4_cuda_activation_upload(v4_moe_split_in, inputs, elements) ||
+         !dsv4_cuda_route_moe_ids_batch_ex(v4_moe_split_in, ids_b, weights_b,
+                                           batch, v4_moe_split_bank,
+                                           config->swiglu_limit,
+                                           v4_moe_split_out, 0)))
+        return -1;
+    /* The peer went first so its half is already running; the primary carries
+     * the shared experts, which is why the peer was told to leave them out. */
+    if (!dsv4_cuda_route_moe_ids_batch_ex(in_mirror, split ? ids_a : ids,
+                                          split ? weights_a : route_weights,
+                                          batch, bank, config->swiglu_limit,
+                                          out_mirror, 1) ||
         !dsv4_cuda_activation_download(outputs, out_mirror, elements) ||
         !dsv4_cuda_activation_sync(out_mirror))
         return -1;
+    if (split) {
+        if (!dsv4_cuda_activation_download(v4_moe_split_host, v4_moe_split_out,
+                                           elements) ||
+            !dsv4_cuda_activation_sync(v4_moe_split_out))
+            return -1;
+        for (long long i = 0; i < elements; i++)
+            outputs[i] += v4_moe_split_host[i];
+    }
     return 0;
 #undef bank
 #undef bank_layer
