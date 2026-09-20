@@ -2313,6 +2313,13 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
      * the outer team is one thread and the two inner loops below take the
      * parallelism instead (guarded if(S==1)) -- one active level in either
      * mode, no nested teams, no oversubscription games. */
+    /* Wall, not aggregate CPU: the reduction below sums per-thread seconds, so
+     * at prefill these two phases used to report ~20x what the clock saw while
+     * every other phase reports wall -- the phase sum came to 510 s against a
+     * 268 s TTFT. Take the clock across the whole team and split it by CPU
+     * share. At decode S==1 the outer loop is serial, cpu_total equals the
+     * wall, and the rescale below is an exact no-op. */
+    double qsa_wall_started=now_s();
     #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
     for(int s=0;s<S;s++){
         int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
@@ -2357,6 +2364,11 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         }
         attn_dt+=now_s()-phase_started;
         free(qidx);free(selected);
+    }
+    double qsa_wall=now_s()-qsa_wall_started,cpu_total=index_dt+attn_dt;
+    if(cpu_total>0.0){
+        index_dt=qsa_wall*(index_dt/cpu_total);
+        attn_dt =qsa_wall*(attn_dt /cpu_total);
     }
     #pragma omp critical
     {
