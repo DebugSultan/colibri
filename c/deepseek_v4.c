@@ -9997,6 +9997,15 @@ static void *v4_gpu_upload_bf16_matrix(ColiDeepSeekV4LayerWeights *weights,
     return tensor;
 }
 
+/* The routing kernels read a fixed-width logit vector; pruned checkpoints
+ * ship fewer experts than that, so their mirrors are padded out to the full
+ * width. PAD_LOGIT underflows route_prob()'s softplus to exactly zero and
+ * PAD_BIAS sits below every real score, so a filler slot can never win a
+ * top-k seat and no kernel has to change. */
+#define V4_GPU_ROUTER_SLOTS 256
+#define V4_GPU_ROUTER_PAD_LOGIT (-1.0e4f)
+#define V4_GPU_ROUTER_PAD_BIAS (-1.0e9f)
+
 /* The MoE router gate is resident as bf16; dsv4_cuda_route wants an f32 mirror
  * (fmt 32, O=experts, I=hidden). Decode once at upload, like the fp8 path. */
 static void *v4_gpu_upload_gate(ColiDeepSeekV4LayerWeights *weights, int device,
@@ -10008,16 +10017,20 @@ static void *v4_gpu_upload_gate(ColiDeepSeekV4LayerWeights *weights, int device,
     if (!data || !spec || spec->dtype != COLI_ST_BF16 || spec->rank != 2)
         return NULL;
     int64_t experts = spec->shape[0], dimension = spec->shape[1];
-    if (experts != 256 || dimension < 1) return NULL;
-    float *f32 = malloc((size_t)experts * dimension * sizeof(*f32));
+    if (experts < 1 || experts > V4_GPU_ROUTER_SLOTS || dimension < 1)
+        return NULL;
+    int64_t rows = V4_GPU_ROUTER_SLOTS;
+    float *f32 = malloc((size_t)rows * dimension * sizeof(*f32));
     if (!f32) return NULL;
     const uint16_t *src = data;
     for (int64_t i = 0; i < experts * dimension; i++) {
         uint32_t bits = (uint32_t)src[i] << 16;
         memcpy(&f32[i], &bits, sizeof(bits));
     }
+    for (int64_t i = experts * dimension; i < rows * dimension; i++)
+        f32[i] = V4_GPU_ROUTER_PAD_LOGIT;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_f32(&tensor, f32, (int)experts, (int)dimension,
+    if (!dsv4_cuda_upload_f32(&tensor, f32, (int)rows, (int)dimension,
                               device)) {
         free(f32);
         return NULL;
@@ -10037,10 +10050,18 @@ static void *v4_gpu_upload_gate_bias(ColiDeepSeekV4LayerWeights *weights,
     if (!data || !spec || spec->dtype != COLI_ST_F32 || spec->rank != 1)
         return NULL;
     int64_t experts = spec->shape[0];
-    if (experts != 256) return NULL;
+    if (experts < 1 || experts > V4_GPU_ROUTER_SLOTS) return NULL;
+    float *f32 = malloc((size_t)V4_GPU_ROUTER_SLOTS * sizeof(*f32));
+    if (!f32) return NULL;
+    memcpy(f32, data, (size_t)experts * sizeof(*f32));
+    for (int64_t i = experts; i < V4_GPU_ROUTER_SLOTS; i++)
+        f32[i] = V4_GPU_ROUTER_PAD_BIAS;
     Dsv4CudaTensor *tensor = NULL;
-    if (!dsv4_cuda_upload_f32(&tensor, data, (int)experts, 1, device))
+    if (!dsv4_cuda_upload_f32(&tensor, f32, V4_GPU_ROUTER_SLOTS, 1, device)) {
+        free(f32);
         return NULL;
+    }
+    free(f32);
     if (bytes) *bytes += dsv4_cuda_tensor_bytes(tensor);
     return tensor;
 }
@@ -10219,8 +10240,11 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
                       const float *bias, const int *forced_indices,
                       int experts, int dimension, int topk, float route_scale) {
     if (!route_weights || !indices || !input || !weights) return -1;
-    /* The backend route kernel is hardwired to 256 experts / top-k 6. */
-    if (experts != 256 || topk != 6 || dimension < 1) return -1;
+    /* The kernel reads V4_GPU_ROUTER_SLOTS logits and top-k 6; a narrower
+     * checkpoint rides the padded mirror. */
+    if (experts < 1 || experts > V4_GPU_ROUTER_SLOTS || topk != 6 ||
+        dimension < 1)
+        return -1;
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias_t = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
     if (!gate || (bias && !bias_t)) return -1;
@@ -10755,9 +10779,12 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     }
     if (!outputs || !weights || !config || !store || !inputs || !tokens ||
         batch < 1 || batch > 128) V4_MOE_BATCH_REFUSE("bad arguments");
-    /* The backend batch kernels are hardwired to this geometry. */
-    if (config->n_routed_experts != 256 || config->hidden_size != 4096 ||
-        config->num_experts_per_tok != 6)
+    /* The backend batch kernels are hardwired to this geometry. The bank
+     * is always V4_GPU_ROUTER_SLOTS wide: a pruned checkpoint simply
+     * leaves its tail slots unaddressed. */
+    if (config->n_routed_experts < 1 ||
+        config->n_routed_experts > V4_GPU_ROUTER_SLOTS ||
+        config->hidden_size != 4096 || config->num_experts_per_tok != 6)
         V4_MOE_BATCH_REFUSE("unsupported model geometry");
     Dsv4CudaTensor *gate = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate");
     Dsv4CudaTensor *bias = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "ffn.gate.bias");
@@ -10770,7 +10797,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
     int device = dsv4_cuda_tensor_device(gate);
     if (device < 0) return -1;
     if (!bank) {
-        bank = dsv4_cuda_expert_bank_create(256, 4096, 2048, device, sg, su, sd);
+        bank = dsv4_cuda_expert_bank_create(V4_GPU_ROUTER_SLOTS, 4096, 2048, device, sg, su, sd);
         if (!bank) {
             /* Out of VRAM, or shared-mirror shapes off: remember instead of
              * retrying a 2 GiB allocation on every chunk. */
@@ -10779,7 +10806,8 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             bank_failed = 1;
             return -1;
         }
-        fprintf(stderr, "v4_gpu moe-batch=on bank=256-experts\n");
+        fprintf(stderr, "v4_gpu moe-batch=on bank=%d-slots experts=%d\n",
+                V4_GPU_ROUTER_SLOTS, config->n_routed_experts);
     }
     /* Route-aware refill: the persistent bank is a perfect per-layer expert
      * cache. Each chunk routes first, then uploads only the routed experts
@@ -10812,7 +10840,7 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
             if (next >= 0) {
                 if (!v4_moe_bank2) {
                     v4_moe_bank2 = dsv4_cuda_expert_bank_create(
-                        256, 4096, 2048, device, sg, su, sd);
+                        V4_GPU_ROUTER_SLOTS, 4096, 2048, device, sg, su, sd);
                     if (!v4_moe_bank2) {
                         /* Not enough VRAM for two full banks: stay on the
                          * proven single-bank path, permanently and loudly. */
