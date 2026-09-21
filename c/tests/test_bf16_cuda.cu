@@ -53,7 +53,8 @@ __global__ static void decode_all(const void *w, float *out, int n) {
 
 int main(void) {
     int bad = 0;
-    if (!coli_cuda_init((int[]){0}, 1)) { printf("FAIL cuda init\n"); return 1; }
+    int devs[1] = {0};
+    if (!coli_cuda_init(devs, 1)) { printf("FAIL cuda init\n"); return 1; }
 
     /* ---- claim 1: exhaustive bit-exact decode ---- */
     {
