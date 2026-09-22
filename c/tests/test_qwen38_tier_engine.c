@@ -119,6 +119,52 @@ int main(void) {
     qt_shutdown();
     tk(qt_dense_count() == 0, "dense handles released at shutdown");
 
+    /* Passes three to five: the prompt-length gate on Q38_TRUNK_PREFILL.
+     *
+     * The batched trunk path (qt_dense_matmul_batch) buys a long prefill at
+     * the price of a launch per GEMM, so below some prompt length it is a
+     * loss -- kreuzzelg measured +7% at 315 tokens on an sm_86 3070 where we
+     * measured -17.9% at ~3k. The gate must therefore SUPPRESS the batch
+     * call under its threshold, and an oracle alone cannot see that: the
+     * tokens are identical either way (the fake backend computes fmt 1 for
+     * any S, exactly like the CPU int8 reference). What separates the two is
+     * how many matmuls the tier was asked for, which fake_matmuls counts.
+     *
+     * Baseline (batch off) and gated (default threshold, five-token prompt)
+     * must agree exactly; lifting the threshold to 0 must ask for strictly
+     * more. Env is read per model in model_init_range, so three runs in this
+     * one process really do see three different settings. */
+    printf(" prompt-length gate on the batched trunk\n");
+    unsetenv("Q38_TRUNK_PREFILL");
+    unsetenv("Q38_TRUNK_PREFILL_MIN_TOKENS");
+    fake_matmuls = 0;
+    rc = qwen38_main_unused(4, argv);
+    int gate_off = fake_matmuls;
+    tk(rc == 0, "batch path off (Q38_TRUNK_PREFILL unset): oracle intact");
+    qt_shutdown();
+
+    setenv("Q38_TRUNK_PREFILL", "1", 1);          /* default threshold: 2048 > 5 */
+    fake_matmuls = 0;
+    rc = qwen38_main_unused(4, argv);
+    int gate_closed = fake_matmuls;
+    tk(rc == 0, "gate closed at the default threshold: oracle intact");
+    tk(gate_closed == gate_off,
+       "gate closed asks for no batched trunk matmul (same count as batch off)");
+    qt_shutdown();
+
+    setenv("Q38_TRUNK_PREFILL_MIN_TOKENS", "0", 1);
+    fake_matmuls = 0;
+    rc = qwen38_main_unused(4, argv);
+    int gate_open = fake_matmuls;
+    tk(rc == 0, "gate lifted (MIN_TOKENS=0): oracle intact");
+    tk(gate_open > gate_closed,
+       "gate lifted routes prefill GEMMs to the batched trunk path");
+    qt_shutdown();
+    unsetenv("Q38_TRUNK_PREFILL");
+    unsetenv("Q38_TRUNK_PREFILL_MIN_TOKENS");
+    printf("  gate: matmuls off=%d closed=%d open=%d\n",
+           gate_off, gate_closed, gate_open);
+
     if (t_fails) { printf("test_qwen38_tier_engine: %d failure(s)\n", t_fails); return 1; }
     printf("test_qwen38_tier_engine: ok\n");
     return 0;

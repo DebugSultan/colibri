@@ -25,6 +25,14 @@
 #define Q38_MAX_PLE_PARTS 512
 #define Q38_PREFILL_BATCH_ROWS 32
 #define Q38_PREFILL_WORKSPACE_BYTES (64u << 20)
+/* Below this prompt length the batched trunk prefill does not turn itself on.
+ * The two numbers that exist: at 315 tokens on kreuzzelg's sm_86 3070 (#1306)
+ * it COST 7% of TTFT; at ~3k tokens on this rig it saved 17.9%. The crossover
+ * is somewhere between and has NOT been measured -- 2048 is a conservative
+ * default to be calibrated on hardware, not a result. Setting
+ * Q38_TRUNK_PREFILL_MIN_TOKENS=0 removes the gate, which is the shape a
+ * reproducible A/B needs. */
+#define Q38_TRUNK_PREFILL_MIN_TOKENS 2048
 
 typedef struct {
     int hidden, layers, vocab, max_positions, eos_id;
@@ -283,6 +291,26 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
  * so they are the default.  Q38_SIMD_MATMUL=0 selects the reference path
  * instead, which keeps both arms of an A/B measurement inside one binary. */
 static int q38_env_bool(const char *name,int default_value);
+static int q38_env_int_in(const char *name,int default_value,
+                          int min_value,int max_value);
+
+/* How many tokens the forward in flight is prefilling, 0 while decoding.
+ * step() receives the whole prompt at once (minus any reused prefix), so
+ * this is the length the two published measurements are about -- NOT the
+ * rows of one GEMM, which prefill chunking caps at Q38_PREFILL_BATCH_ROWS
+ * for the MoE and DeltaNet callers while QSA still passes the full span.
+ * Written once per forward, before any parallel region opens; read only
+ * from there on. One forward at a time is the engine's own contract -- the
+ * server holds run_lock across a request -- so a file-scope int is enough. */
+static int q38_prefill_span=0;
+
+/* Q38_TRUNK_PREFILL and its threshold, resolved once per model in
+ * model_init_range() alongside the engine's other env. A function-local
+ * static resolved at the first matmul and never re-read would make the gate
+ * invisible to anyone loading two models in one process -- which is exactly
+ * what the fake-backend bench does. */
+static int q38_trunk_prefill=0;
+static int q38_trunk_prefill_min=Q38_TRUNK_PREFILL_MIN_TOKENS;
 
 static int q38_simd_matmul(void) {
 #ifdef __AVX2__
@@ -303,12 +331,10 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
      * The kernel was always batch-shaped (quant_matmul launches grid (O,S));
      * upstream pinned the reference for its own hardware, where prefill is
      * not 19.7 seconds of CPU bf16 GEMM like it is on this rig. */
-    static int trunk_prefill=-1;
-    if(trunk_prefill<0){const char*tp=getenv("Q38_TRUNK_PREFILL");
-                        trunk_prefill=(tp&&tp[0]=='1'&&!tp[1])?1:0;}
     if(S==1&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul(weight->gpu-1,y,x,I,O))return;
-    if(S>1&&trunk_prefill&&weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
+    if(S>1&&q38_trunk_prefill&&q38_prefill_span>=q38_trunk_prefill_min&&
+       weight&&weight->gpu&&weight->rows==O&&weight->cols==I&&
        qt_dense_matmul_batch(weight->gpu-1,y,x,S,I,O))return;
     if(S==1&&weight&&weight->q8&&weight->rows==O&&weight->cols==I){
         /* the int8 rows the GPU would hold, computed here: what the trunk
@@ -966,6 +992,11 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
     m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
     m->prefill_batch=q38_env_bool("Q38_PREFILL_BATCH",1);
+    {const char *tp=getenv("Q38_TRUNK_PREFILL");
+     q38_trunk_prefill=(tp&&tp[0]=='1'&&!tp[1])?1:0;}
+    q38_trunk_prefill_min=q38_env_int_in("Q38_TRUNK_PREFILL_MIN_TOKENS",
+                                         Q38_TRUNK_PREFILL_MIN_TOKENS,
+                                         0,1<<24);
     q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
     {
         const char *i4snap=getenv("Q38_INT4_SNAP");
@@ -1900,19 +1931,19 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(!jobs)return 0;
     for(int index=0;index<count;index++){
         int expert=experts[index];
-        if(expert<0||expert>=m->c.experts)return 0;
+        if(expert<0||expert>=m->c.experts){free(jobs);return 0;}
         q38_ehit_mark(m,layer,expert);
         for(int previous=0;previous<index;previous++)
-            if(experts[previous]==expert)return 0;
+            if(experts[previous]==expert){free(jobs);return 0;}
         int slot_index=cache->by_expert[expert];
         if(slot_index>=0){
-            if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert)return 0;
+            if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert){free(jobs);return 0;}
             continue;
         }
         st_tensor *weight[3];
         if(m->int4_active){
-            if(!q38_int4_expert_tensors(m,layer,expert,weight))return 0;
-        }else if(!q38_native_fp8_expert_tensors(m,layer,expert,weight))return 0;
+            if(!q38_int4_expert_tensors(m,layer,expert,weight)){free(jobs);return 0;}
+        }else if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)){free(jobs);return 0;}
     }
     unsigned char *protected_slots=(unsigned char*)calloc((size_t)cache->cap,1);
     if(!protected_slots){fprintf(stderr,"OOM expert batch reservations\n");exit(1);}
@@ -2121,16 +2152,22 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
  * a few percent of what the cores can do.  Both values are therefore runtime
  * knobs now.  Widening the chunk cannot change any result -- boundaries alter
  * neither routing nor accumulation order -- so this is a pure A/B. */
-static int q38_env_positive_int(const char *name,int default_value,
-                                int max_value) {
+static int q38_env_int_in(const char *name,int default_value,
+                          int min_value,int max_value) {
     const char *value=getenv(name);
     if(!value||!*value)return default_value;
     char *end=NULL;long parsed=strtol(value,&end,10);
-    if(end==value||*end||parsed<1||parsed>(long)max_value){
-        fprintf(stderr,"%s must be an integer in 1..%d\n",name,max_value);
+    if(end==value||*end||parsed<(long)min_value||parsed>(long)max_value){
+        fprintf(stderr,"%s must be an integer in %d..%d\n",
+                name,min_value,max_value);
         exit(1);
     }
     return (int)parsed;
+}
+
+static int q38_env_positive_int(const char *name,int default_value,
+                                int max_value) {
+    return q38_env_int_in(name,default_value,1,max_value);
 }
 
 static int q38_prefill_batch_rows(void) {
@@ -2435,6 +2472,13 @@ static int q38_trunk_enabled(void) {
 /* offers, before qt_init: lm_head first (the placer takes it first), then the
  * layers in order so a partial placement is a prefix of the layers */
 static void q38_trunk_offer_all(Model *m) {
+    /* The table holds Q38Weight pointers INTO m, so a previous model's offers
+     * are dangling the moment that model is freed -- and q38_trunk_add only
+     * ever appends. One model per process hides this; a second load (the fake
+     * tier bench runs the engine several times in one process) would quantize
+     * freed weights, which shows up as garbage rows or an absurd malloc.
+     * Reset before the enabled() check: a stale table is stale either way. */
+    g_trunk_n=0;
     if(!q38_trunk_enabled())return;
     Cfg *c=&m->c;
     q38_trunk_add(&m->lm_head,"lmhead",0);
@@ -2968,6 +3012,7 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
     m->timers.forwards++;
+    q38_prefill_span=(S>1)?S:0;
     float *hyper=falloc((int64_t)S*W);
     /* Le righe PLE partono ADESSO, non al layer 2 dove servono: sono note dagli
      * id dei token soltanto, e i due layer che le precedono danno il tempo di
